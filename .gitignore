@@ -1,0 +1,40 @@
+# AxiomCE — .gitignore
+
+# --- Local-only sensitive data (Restricted class); never commit ---
+private/
+!private/.gitkeep
+
+# --- Never-store safety nets (should never be created, but block anyway) ---
+*.pem
+*.key
+*.pfx
+*.p12
+*.env
+.env
+.env.*
+*secret*
+*credential*
+*password*
+id_rsa*
+*.tax
+*.tax.*
+
+# --- Generated, disposable views ---
+*.view.md
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.vscode/
+.idea/
+
+# --- Node / tooling ---
+node_modules/
+npm-debug.log*
+
+# --- Scratch ---
+*.tmp
+*.bak

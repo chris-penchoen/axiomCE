@@ -1,0 +1,13 @@
+#!/bin/sh
+# AxiomCE pre-commit hook — runs the privacy guard on staged Markdown files.
+# Install (after `git init`):
+#   cp tools/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# On Windows without chmod, Git honors the file as long as it exists at that path.
+#
+# BLOCK issues abort the commit (exit 1). WARN issues print but allow the commit.
+
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.md')
+[ -z "$staged" ] && exit 0
+
+# shellcheck disable=SC2086
+node tools/privacy-check.mjs $staged

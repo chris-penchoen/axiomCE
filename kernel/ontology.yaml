@@ -1,0 +1,135 @@
+# kernel/ontology.yaml — AxiomCE hybrid-prototype ontology
+# Plain documentation + machine-readable schema. No YAML library is required to
+# use the store: tools/generate-views.mjs parses only JSONL claims and Markdown
+# front matter. This file is the contract that keeps every future agent aligned.
+
+version: 0.1.0
+status: prototype
+updated: 2026-07-14
+
+# ---------------------------------------------------------------------------
+# Entity identity
+# ---------------------------------------------------------------------------
+entity:
+  # entity_id is opaque and permanent: "<type>:<slug>". Never renamed.
+  # Display names/aliases are attributes, not keys.
+  id_format: "<type>:<kebab-slug>"
+  filename_rule: "colon is illegal on Windows; entity files use '<type>-<slug>.md'"
+  types:
+    - person
+    - organization
+    - vehicle
+    - finance        # a financial domain/aggregate (e.g. finance:budget)
+    - project
+    - event
+    - place
+    - account        # identity only; never store full numbers (see Never-store)
+    - source         # a provenance record
+
+# ---------------------------------------------------------------------------
+# Claim schema (one JSON object per line in a .jsonl file)
+# ---------------------------------------------------------------------------
+claim:
+  required: [id, entity, predicate, value, confidence, classification, valid_from, asserted_at, source]
+  optional: [valid_to, retracted_at, supersedes, note]
+  fields:
+    id:             "clm-<domain>-NNNN, stable and unique"
+    entity:         "an entity_id"
+    predicate:      "kebab-case slug; OPEN vocabulary, documented per entity"
+    value:          "compact prose or scalar — NOT decomposed into rigid triples"
+    confidence:     "one of confidence.levels"
+    classification: "one of privacy.classifications"
+    valid_from:     "YYYY-MM-DD — when true in the world"
+    valid_to:       "YYYY-MM-DD or null — null = still current"
+    asserted_at:    "ISO timestamp — when recorded"
+    retracted_at:   "ISO timestamp or null — when withdrawn"
+    supersedes:     "claim id this replaces, or null"
+    source:         "source-record id or canonical entity id (MUST be present)"
+    note:           "optional free prose"
+
+# When to mint a claim (NOT for everything — narrative stays in canonical records)
+claim_when:
+  - atomic          # a single discrete fact
+  - time_varying    # a value that changes over time (price, condition, status)
+  - conflicting     # sources disagree; keep both, resolve explicitly
+  - decision_relevant  # feeds a "can I afford / should I" decision
+  - queryable       # something an agent will look up directly
+
+# ---------------------------------------------------------------------------
+# Epistemics
+# ---------------------------------------------------------------------------
+confidence:
+  levels: [confirmed, user-stated, inferred, estimate, unresolved]
+  ordering: "confirmed > user-stated > inferred > estimate > unresolved"
+
+# ---------------------------------------------------------------------------
+# Temporal / lifecycle semantics
+# ---------------------------------------------------------------------------
+lifecycle:
+  active: "retracted_at is null AND not superseded by another claim AND (valid_to is null or >= today)"
+  superseded: "another claim's supersedes == this claim.id"
+  retracted: "retracted_at is set"
+  expired: "valid_to is in the past"
+  contradiction: ">1 active claim sharing the same entity+predicate"
+
+# ---------------------------------------------------------------------------
+# View generation
+# ---------------------------------------------------------------------------
+view:
+  generated: true            # never hand-edit *.view.md; regenerate
+  # When a predicate is contradicted (>1 active claim), the view names a
+  # GOVERNING claim by this precedence. Note: an explicit `unresolved` safety
+  # guard OUTRANKS an optimistic `estimate` — "unknown" must not be overridden
+  # by a guess. Ties broken by lowest claim id.
+  governing_precedence: [confirmed, user-stated, inferred, unresolved, estimate]
+
+# ---------------------------------------------------------------------------
+# Reconciliation (canonical prose <-> active claims)
+# ---------------------------------------------------------------------------
+reconcile:
+  # Explicit manifest of which canonical fields are claim-backed. No fuzzy or
+  # semantic comparison is performed. See reconcile/manifest.jsonl and
+  # private/reconcile/manifest.jsonl.
+  manifest_entry: [entity, predicate, canonical, token]
+  token: "literal string expected to appear in `canonical` when it reflects the active claim"
+  findings: [MISSING_CLAIM, STALE_CANONICAL, UNRESOLVED_CONTRADICTION, STALE_VIEW]
+  never: "reconcile MUST NOT rewrite canonical prose; it only reports"
+
+# ---------------------------------------------------------------------------
+# Tooling (all zero-dependency Node; no db/embeddings/service/network)
+# ---------------------------------------------------------------------------
+tools:
+  validate: "tools/validate.mjs — Markdown front matter + links"
+  validate_claims: "tools/validate-claims.mjs — .jsonl schema/refs + .yaml well-formedness"
+  privacy_check: "tools/privacy-check.mjs — leak scan of tracked .md/.jsonl/.yaml"
+  generate_views: "tools/generate-views.mjs — build *.view.md (use --check for staleness)"
+  reconcile: "tools/reconcile.mjs — canonical/claim/view divergence report"
+
+# ---------------------------------------------------------------------------
+# Privacy
+# ---------------------------------------------------------------------------
+privacy:
+  classifications: [public, personal, sensitive, restricted]
+  placement:
+    public: tracked
+    personal: tracked
+    sensitive: "prefer private/ ; tracked only with opt-in"
+    restricted: "private/ only (git-excluded)"
+  never_store:   # not even in private/
+    - passwords
+    - api_keys_tokens
+    - full_bank_account_numbers
+    - full_card_numbers
+    - ssn
+    - auth_codes
+  view_routing: "restricted/sensitive entity -> private/views/ ; else views/"
+
+# ---------------------------------------------------------------------------
+# Layer precedence (source of truth)
+# ---------------------------------------------------------------------------
+layers:
+  - raw_imports       # immutable
+  - canonical_records # human-editable narrative sources of truth
+  - claims            # append-only atomic facts
+  - entities          # stable identity + pointers
+  - views             # generated, do-not-edit, disposable

@@ -1,0 +1,2 @@
+# Normalize line endings: store text as LF, auto-detect binary files.
+* text=auto eol=lf

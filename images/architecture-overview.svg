@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820">
+  <rect width="1400" height="820" fill="white"/>
+  <style>
+    .box { fill: #f7f7f7; stroke: #222; stroke-width: 2; rx: 14; }
+    .title { font: 700 30px Arial, sans-serif; fill: #111; }
+    .label { font: 600 24px Arial, sans-serif; fill: #111; }
+    .small { font: 20px Arial, sans-serif; fill: #333; }
+    .arrow { stroke: #222; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+  </style>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+    </marker>
+  </defs>
+  <text x="700" y="60" text-anchor="middle" class="title">AxiomCE</text>
+  <text x="700" y="95" text-anchor="middle" class="small">The Axiom Continuity Engine - durable human–AI collaboration</text>
+
+  <rect x="90" y="160" width="470" height="270" class="box"/>
+  <text x="325" y="205" text-anchor="middle" class="label">Knowledge Pillar</text>
+  <text x="325" y="245" text-anchor="middle" class="small">What is known or believed?</text>
+  <text x="140" y="300" class="small">• Sources and provenance</text>
+  <text x="140" y="340" class="small">• Claims and temporal state</text>
+  <text x="140" y="380" class="small">• Entities, conflicts, generated views</text>
+
+  <rect x="840" y="160" width="470" height="270" class="box"/>
+  <text x="1075" y="205" text-anchor="middle" class="label">Cognitive-Model Pillar</text>
+  <text x="1075" y="245" text-anchor="middle" class="small">How should collaboration work?</text>
+  <text x="890" y="300" class="small">• Policy and stable rule IDs</text>
+  <text x="890" y="340" class="small">• Calibration cases</text>
+  <text x="890" y="380" class="small">• Model adapters and evaluation spec</text>
+
+  <path d="M560 295 L690 295" class="arrow"/>
+  <path d="M840 295 L710 295" class="arrow"/>
+
+  <rect x="540" y="500" width="320" height="120" class="box"/>
+  <text x="700" y="550" text-anchor="middle" class="label">Current AI Model</text>
+  <text x="700" y="585" text-anchor="middle" class="small">GPT · Claude · Gemini · future models</text>
+
+  <path d="M325 430 C325 500, 500 500, 540 550" class="arrow"/>
+  <path d="M1075 430 C1075 500, 900 500, 860 550" class="arrow"/>
+
+  <rect x="540" y="680" width="320" height="90" class="box"/>
+  <text x="700" y="735" text-anchor="middle" class="label">Human-Governed Workflow</text>
+  <path d="M700 620 L700 680" class="arrow"/>
+</svg>
