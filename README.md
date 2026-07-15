@@ -12,9 +12,15 @@ updated: 2026-07-15
 
 ## Where this sits: the three layers
 
-- **Axiom** - the invariant theory: what continuity is and why it matters (see the Axiom canon in the parent directory).
+- **Axiom** - the invariant theory: what continuity is and why it matters (the Axiom canon, included here as the `axiom/` submodule).
 - **AxiomCE** - the Continuity Engine that operationalizes Axiom. **This package documents AxiomCE.**
 - **axiomCE-sample** - the reference implementation: a public, data-free sample instance of AxiomCE that private implementations can be derived from.
+
+> **Canon dependency.** AxiomCE carries the Axiom canon as the `axiom/`
+> submodule — the theory is never copied in, to prevent drift. Clone with
+> `git clone --recurse-submodules …`, or run
+> `git submodule update --init --recursive` after a plain clone.
+
 
 AxiomCE began as a practical problem: preserve years of useful context and working habits when moving between AI systems. It became a broader architecture for separating:
 
