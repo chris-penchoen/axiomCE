@@ -31,9 +31,10 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
 import { parseFrontMatter } from "./validate.mjs";
-import { loadClaims, loadEntities, classify, governing } from "./generate-views.mjs";
+import { loadClaims, loadEntities, classify, governing, generateAll } from "./generate-views.mjs";
 import { validateClaimShape } from "./validate-claims.mjs";
 import { scanContent, scanSensitiveData } from "./privacy-check.mjs";
 
@@ -41,6 +42,107 @@ const ROOT = path.resolve(".");
 const TODAY = new Date().toISOString().slice(0, 10);
 const PRIVATE_CLASSES = new Set(["restricted", "sensitive"]);
 const byId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
+// ---------------------------------------------------------------------------
+// runtime layer: operational state, kept OUTSIDE the human knowledge model
+// ---------------------------------------------------------------------------
+//
+// The runner's own bookkeeping (dedup ledger, ratification queue, run
+// manifests) lives under runtime/ (public/personal) and private/runtime/
+// (restricted/sensitive, git-excluded). It never mixes with continuity state
+// (claims/, entities/). This is the runtime-vs-continuity boundary: knowledge
+// must not depend on runner internals, and runner internals must not pollute
+// the ontology.
+
+const OBSERVATIONS_DIR = "inbox/observations";
+
+/** Resolve the runtime state paths, routed public vs private by sensitivity. */
+function runtimePaths(root = ROOT, isPrivate = false) {
+  const base = isPrivate ? path.join(root, "private", "runtime") : path.join(root, "runtime");
+  return {
+    dir: base,
+    ledger: path.join(base, "ledger.jsonl"),
+    queue: path.join(base, "ratification-queue.jsonl"),
+    // Run manifests are always tracked — they carry ids/counts, never values.
+    runs: path.join(root, "runtime", "runs"),
+  };
+}
+
+/**
+ * Stable content hash for a candidate claim — the idempotency key (`obs_id`).
+ * Hashes ONLY the semantic fields, never the minted id or asserted_at (which
+ * vary per run), so re-observing identical content is a guaranteed no-op
+ * regardless of source file or when it was seen.
+ * @param {object} obj a parsed candidate claim
+ * @returns {string} e.g. "obs-1a2b3c4d5e6f7a8b"
+ */
+export function candidateHash(obj) {
+  const semantic = {
+    entity: obj.entity ?? null,
+    predicate: obj.predicate ?? null,
+    value: obj.value ?? null,
+    confidence: obj.confidence ?? null,
+    classification: obj.classification ?? null,
+    valid_from: obj.valid_from ?? null,
+    valid_to: obj.valid_to ?? null,
+    supersedes: obj.supersedes ?? null,
+    note: obj.note ?? null,
+    source: obj.source ?? null,
+  };
+  const canon = JSON.stringify(semantic, Object.keys(semantic).sort());
+  return "obs-" + crypto.createHash("sha256").update(canon).digest("hex").slice(0, 16);
+}
+
+/** Read a JSONL file into parsed objects (skips blank/`//` lines). */
+function readJsonl(abs) {
+  if (!fs.existsSync(abs)) return [];
+  const out = [];
+  fs.readFileSync(abs, "utf8").split(/\r?\n/).forEach((raw) => {
+    const t = raw.trim();
+    if (!t || t.startsWith("//")) return;
+    try { out.push(JSON.parse(t)); } catch { /* skip malformed operational line */ }
+  });
+  return out;
+}
+
+/** Append objects to a JSONL file (UTF-8, no BOM), creating dirs as needed. */
+function appendJsonl(abs, objs) {
+  if (!objs.length) return;
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  let existing = fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+  if (existing && !existing.endsWith("\n")) existing += "\n";
+  fs.writeFileSync(abs, existing + objs.map((o) => JSON.stringify(o)).join("\n") + "\n", { encoding: "utf8" });
+}
+
+/** Overwrite a JSONL file with the given objects (used to rewrite the queue). */
+function writeJsonl(abs, objs) {
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, objs.length ? objs.map((o) => JSON.stringify(o)).join("\n") + "\n" : "", { encoding: "utf8" });
+}
+
+/**
+ * Reduce the append-only ledger (public + private) to the latest status per
+ * obs_id. Returns a Map obs_id -> latest entry.
+ */
+export function loadLedger(root = ROOT) {
+  const entries = [
+    ...readJsonl(runtimePaths(root, false).ledger),
+    ...readJsonl(runtimePaths(root, true).ledger),
+  ];
+  const latest = new Map();
+  for (const e of entries) {
+    if (e && e.obs_id) latest.set(e.obs_id, e); // later lines win (chronological)
+  }
+  return latest;
+}
+
+/** Load queued (pending) claims from the public + private queues. */
+export function loadQueue(root = ROOT) {
+  return [
+    ...readJsonl(runtimePaths(root, false).queue),
+    ...readJsonl(runtimePaths(root, true).queue),
+  ];
+}
 
 // ---------------------------------------------------------------------------
 // Shared: routing + id minting (deterministic)
@@ -311,6 +413,66 @@ export function assembleContext(root = ROOT, opts = {}) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Evaluate a single candidate claim: mint id/asserted_at if absent, then run
+ * the structural + referential + privacy gates. Mutates `obj` (adds id,
+ * asserted_at; strips id_domain). Deterministic; writes nothing. Shared by
+ * `capture` and `sync` so both apply the exact same gates.
+ *
+ * @param {object} obj parsed candidate (may carry id_domain)
+ * @param {{root:string, entityIds:Set<string>, known:object[], mintedIds:string[], now:string}} ctx
+ * @returns {{problems:string[], warns:string[], target:string|null, private:boolean, shapeOk:boolean}}
+ */
+export function evaluateCandidate(obj, ctx) {
+  const { root, entityIds, known, mintedIds, now } = ctx;
+  const problems = [];
+
+  // Mint id + asserted_at if absent.
+  const idDomain = obj.id_domain;
+  delete obj.id_domain; // not part of the claim schema
+  if (!obj.id) {
+    if (!idDomain || typeof idDomain !== "string") {
+      problems.push("missing id and id_domain (need one to mint an id)");
+      return { problems, warns: [], target: null, private: false, shapeOk: false };
+    }
+    const minted = nextClaimId([...known, ...mintedIds.map((id) => ({ id }))], idDomain);
+    obj.id = minted;
+    mintedIds.push(minted);
+  }
+  if (!obj.asserted_at) obj.asserted_at = now;
+
+  // Structural validation (schema/enums/dates/ids).
+  const shapeProblems = validateClaimShape(obj);
+  for (const m of shapeProblems) problems.push(m);
+
+  // Referential: entity must exist.
+  if (typeof obj.entity === "string" && !entityIds.has(obj.entity)) {
+    problems.push(`references missing entity: ${obj.entity} (create the entity first)`);
+  }
+
+  // Privacy gate. Never-store secrets ALWAYS block. Sensitive-data heuristics
+  // block only when the claim would land in a TRACKED log; under private/ that
+  // content is allowed (authoritative local context).
+  const target = claimLogPath(obj.entity || "unknown:unknown", obj.classification, root);
+  const isPrivate = PRIVATE_CLASSES.has(obj.classification);
+  const scanText = `${obj.value || ""}\n${obj.note || ""}`;
+  const { blocks: secretBlocks, warns } = scanContent(scanText);
+  for (const b of secretBlocks) problems.push(`never-store secret — ${b}`);
+  if (!isPrivate) {
+    for (const b of scanSensitiveData(scanText)) {
+      problems.push(`sensitive data in a tracked claim — ${b}; set classification restricted/sensitive so it routes to private/`);
+    }
+  }
+
+  return {
+    problems,
+    warns,
+    target: path.relative(root, target),
+    private: isPrivate,
+    shapeOk: shapeProblems.length === 0,
+  };
+}
+
+/**
  * Plan a capture from a candidate-claims envelope. Pure/deterministic: computes
  * the minted claim, target log, and any blocking problems WITHOUT writing.
  *
@@ -358,50 +520,15 @@ export function planCapture(root, envelopePath, opts = {}) {
       return;
     }
 
-    // Mint id + asserted_at if absent.
-    const idDomain = obj.id_domain;
-    delete obj.id_domain; // not part of the claim schema
-    if (!obj.id) {
-      if (!idDomain || typeof idDomain !== "string") {
-        problems.push({ line: lineNo, msg: "missing id and id_domain (need one to mint an id)" });
-        return;
-      }
-      const minted = nextClaimId([...known, ...mintedIds.map((id) => ({ id }))], idDomain);
-      obj.id = minted;
-      mintedIds.push(minted);
-    }
-    if (!obj.asserted_at) obj.asserted_at = now;
-
-    // Structural validation (schema/enums/dates/ids).
-    const shapeProblems = validateClaimShape(obj);
-    for (const m of shapeProblems) problems.push({ line: lineNo, msg: m });
-
-    // Referential: entity must exist.
-    if (typeof obj.entity === "string" && !entityIds.has(obj.entity)) {
-      problems.push({ line: lineNo, msg: `references missing entity: ${obj.entity} (create the entity first)` });
-    }
-
-    // Privacy gate. Never-store secrets ALWAYS block. Sensitive-data heuristics
-    // block only when the claim would land in a TRACKED log; under private/ that
-    // content is allowed (authoritative local context).
-    const target = claimLogPath(obj.entity || "unknown:unknown", obj.classification, root);
-    const isPrivate = PRIVATE_CLASSES.has(obj.classification);
-    const scanText = `${obj.value || ""}\n${obj.note || ""}`;
-    const { blocks: secretBlocks, warns } = scanContent(scanText);
-    for (const b of secretBlocks) problems.push({ line: lineNo, msg: `never-store secret — ${b}` });
-    if (!isPrivate) {
-      for (const b of scanSensitiveData(scanText)) {
-        problems.push({ line: lineNo, msg: `sensitive data in a tracked claim — ${b}; set classification restricted/sensitive so it routes to private/` });
-      }
-    }
-
-    if (shapeProblems.length === 0) {
+    const res = evaluateCandidate(obj, { root, entityIds, known, mintedIds, now });
+    for (const m of res.problems) problems.push({ line: lineNo, msg: m });
+    if (res.shapeOk) {
       planned.push({
         line: lineNo,
         claim: obj,
-        target: path.relative(root, target),
-        private: isPrivate,
-        warns,
+        target: res.target,
+        private: res.private,
+        warns: res.warns,
       });
     }
   });
@@ -438,17 +565,229 @@ export function applyCapture(root, planned) {
 }
 
 // ---------------------------------------------------------------------------
+// sync (continuous ingest): observe -> dedup -> gate -> ratification queue
+// ---------------------------------------------------------------------------
+
+/**
+ * Plan a sync: scan inbox/observations/*.jsonl, dedup against the ledger, run
+ * the same gates as capture, and route NEW valid claims toward the ratification
+ * queue (never straight to canon). Pure/deterministic — writes nothing.
+ *
+ * Idempotency: each candidate is hashed (semantic content only) BEFORE minting.
+ * Anything whose hash is already in the ledger — or seen earlier in this run —
+ * is skipped, so re-running (or `--watch` re-firing) is a safe no-op.
+ *
+ * @param {string} root
+ * @param {{ now?: string }} opts
+ * @returns {{ queued:object[], duplicates:object[], problems:object[], files:string[] }}
+ */
+export function planSync(root = ROOT, opts = {}) {
+  const now = opts.now || new Date().toISOString();
+  const dir = path.join(root, OBSERVATIONS_DIR);
+  const queued = [];
+  const duplicates = [];
+  const problems = [];
+
+  const files = fs.existsSync(dir)
+    ? fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl")).sort()
+    : [];
+
+  const entityIds = new Set(loadEntities(root).map((e) => e.id));
+  const ledger = loadLedger(root);
+  // Seed minting from canon + already-queued claims so new ids stay sequential
+  // and never collide with pending (not-yet-ratified) claims.
+  const known = [...loadClaims(root), ...loadQueue(root).map((q) => ({ id: q.claim.id }))];
+  const mintedIds = [];
+  const seenThisRun = new Set();
+
+  for (const f of files) {
+    const abs = path.join(dir, f);
+    fs.readFileSync(abs, "utf8").split(/\r?\n/).forEach((raw, i) => {
+      const t = raw.trim();
+      if (!t || t.startsWith("//")) return;
+      const lineNo = i + 1;
+
+      let obj;
+      try { obj = JSON.parse(t); } catch (e) {
+        problems.push({ file: f, line: lineNo, msg: `malformed JSON: ${e.message}` });
+        return;
+      }
+      if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
+        problems.push({ file: f, line: lineNo, msg: "candidate is not a JSON object" });
+        return;
+      }
+
+      // Idempotency check BEFORE minting (hash of semantic fields only).
+      const obsId = candidateHash(obj);
+      if (ledger.has(obsId) || seenThisRun.has(obsId)) {
+        duplicates.push({ obs_id: obsId, source_file: f, line: lineNo, status: ledger.get(obsId)?.status || "queued" });
+        return;
+      }
+      seenThisRun.add(obsId);
+
+      const res = evaluateCandidate(obj, { root, entityIds, known, mintedIds, now });
+      for (const m of res.problems) problems.push({ file: f, line: lineNo, msg: m });
+      // Only fully-clean candidates are queued (sync may run unattended).
+      if (res.shapeOk && res.problems.length === 0) {
+        queued.push({
+          obs_id: obsId,
+          claim: obj,
+          target: res.target,
+          private: res.private,
+          source_file: f,
+          line: lineNo,
+          warns: res.warns,
+        });
+      }
+    });
+  }
+
+  return { queued, duplicates, problems, files };
+}
+
+/**
+ * Apply a planned sync: append queued claims to the ratification queue and
+ * record them in the ledger (both routed public/private by classification),
+ * then write a run manifest. Never touches canonical claim logs.
+ * @param {string} root
+ * @param {object} plan output of planSync()
+ * @param {{ now?: string }} opts
+ * @returns {{ queuedCount:number, runManifestPath:string }}
+ */
+export function applySync(root = ROOT, plan, opts = {}) {
+  const now = opts.now || new Date().toISOString();
+  const stamp = now.replace(/[:.]/g, "-");
+  const pub = runtimePaths(root, false);
+  const prv = runtimePaths(root, true);
+
+  const queueBucket = { false: [], true: [] };
+  const ledgerBucket = { false: [], true: [] };
+  for (const q of plan.queued) {
+    const key = String(q.private);
+    queueBucket[key].push({
+      obs_id: q.obs_id,
+      claim: q.claim,
+      target: q.target,
+      private: q.private,
+      source_file: q.source_file,
+      line: q.line,
+      queued_at: now,
+    });
+    ledgerBucket[key].push({
+      obs_id: q.obs_id,
+      claim_id: q.claim.id,
+      status: "queued",
+      classification: q.claim.classification,
+      source_file: q.source_file,
+      first_seen: now,
+    });
+  }
+
+  appendJsonl(pub.queue, queueBucket["false"]);
+  appendJsonl(pub.ledger, ledgerBucket["false"]);
+  appendJsonl(prv.queue, queueBucket["true"]);
+  appendJsonl(prv.ledger, ledgerBucket["true"]);
+
+  // Run manifest — tracked; carries ids/targets/counts, never claim values.
+  const manifest = {
+    run: stamp,
+    generator: "tools/runner.mjs sync",
+    observed_files: plan.files,
+    queued: plan.queued.map((q) => ({ obs_id: q.obs_id, claim_id: q.claim.id, target: q.target, private: q.private })),
+    duplicates: plan.duplicates.length,
+    problems: plan.problems.length,
+  };
+  const runPath = path.join(pub.runs, `${stamp}.json`);
+  fs.mkdirSync(path.dirname(runPath), { recursive: true });
+  fs.writeFileSync(runPath, JSON.stringify(manifest, null, 2) + "\n", { encoding: "utf8" });
+
+  return { queuedCount: plan.queued.length, runManifestPath: path.relative(root, runPath) };
+}
+
+// ---------------------------------------------------------------------------
+// ratify (human gate): promote queued claims into canon (or discard)
+// ---------------------------------------------------------------------------
+
+/**
+ * Plan a ratification: select pending queued claims to promote (or discard).
+ * @param {string} root
+ * @param {{ ids?:string[], all?:boolean }} opts  ids match obs_id OR claim.id
+ * @returns {{ promote:object[], problems:object[] }}
+ */
+export function planRatify(root = ROOT, opts = {}) {
+  const queue = loadQueue(root);
+  const problems = [];
+  let selected;
+  if (opts.all) {
+    selected = queue;
+  } else {
+    const want = new Set(opts.ids || []);
+    selected = queue.filter((q) => want.has(q.obs_id) || want.has(q.claim.id));
+    for (const id of want) {
+      if (!queue.some((q) => q.obs_id === id || q.claim.id === id)) {
+        problems.push({ id, msg: "not found in ratification queue" });
+      }
+    }
+  }
+  const promote = selected.map((q) => ({ queueEntry: q, target: q.target, claim: q.claim, private: q.private }));
+  return { promote, problems };
+}
+
+/**
+ * Apply a ratification: promote (append to canon via applyCapture) or discard
+ * the selected queued claims, remove them from the queue, and append a
+ * status-transition record to the ledger. Caller regenerates views.
+ * @param {string} root
+ * @param {object} plan output of planRatify()
+ * @param {{ now?:string, discard?:boolean }} opts
+ * @returns {{ appended:object[], discarded:number }}
+ */
+export function applyRatify(root = ROOT, plan, opts = {}) {
+  const now = opts.now || new Date().toISOString();
+  const discard = !!opts.discard;
+
+  let appended = [];
+  if (!discard) {
+    ({ appended } = applyCapture(root, plan.promote.map((p) => ({ target: p.target, claim: p.claim }))));
+  }
+
+  // Remove promoted/discarded entries from whichever queue (pub/prv) holds them.
+  const doneObs = new Set(plan.promote.map((p) => p.queueEntry.obs_id));
+  for (const isPrivate of [false, true]) {
+    const qp = runtimePaths(root, isPrivate).queue;
+    if (fs.existsSync(qp)) writeJsonl(qp, readJsonl(qp).filter((q) => !doneObs.has(q.obs_id)));
+  }
+
+  // Append status-transition ledger records (routed by the claim's privacy).
+  const led = { false: [], true: [] };
+  for (const p of plan.promote) {
+    const rec = { obs_id: p.queueEntry.obs_id, claim_id: p.claim.id, status: discard ? "discarded" : "ratified" };
+    rec[discard ? "discarded_at" : "ratified_at"] = now;
+    led[String(p.private)].push(rec);
+  }
+  appendJsonl(runtimePaths(root, false).ledger, led["false"]);
+  appendJsonl(runtimePaths(root, true).ledger, led["true"]);
+
+  return { appended, discarded: discard ? plan.promote.length : 0 };
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const out = { _: [], entity: [], adapter: null, includePrivate: false, apply: false, out: null };
+  const out = { _: [], entity: [], adapter: null, includePrivate: false, apply: false, out: null,
+                watch: false, ids: [], all: false, discard: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--entity") out.entity.push(argv[++i]);
     else if (a === "--adapter") out.adapter = argv[++i];
     else if (a === "--include-private") out.includePrivate = true;
     else if (a === "--apply") out.apply = true;
+    else if (a === "--watch") out.watch = true;
+    else if (a === "--id") out.ids.push(argv[++i]);
+    else if (a === "--all") out.all = true;
+    else if (a === "--discard") out.discard = true;
     else if (a === "-o" || a === "--out") out.out = argv[++i];
     else out._.push(a);
   }
@@ -506,14 +845,90 @@ function runCapture(opts) {
   process.exit(0);
 }
 
+function runSync(opts) {
+  const runOnce = () => {
+    const plan = planSync(ROOT, {});
+    for (const p of plan.problems) console.error(`FAIL ${p.file}:${p.line}: ${p.msg}`);
+    for (const q of plan.queued) for (const w of q.warns) console.error(`WARN ${q.source_file}:${q.line}: ${w}`);
+
+    if (!opts.apply) {
+      console.log(`sync (dry-run): ${plan.queued.length} new claim(s) would be queued, ${plan.duplicates.length} duplicate(s) skipped, ${plan.problems.length} problem(s).`);
+      for (const q of plan.queued) console.log(`  + ${q.claim.id} <- ${q.source_file}:${q.line}  (${q.claim.confidence}, ${q.claim.classification})${q.private ? " [private]" : ""} -> queue`);
+      if (plan.queued.length) console.log(`\nRe-run with --apply to enqueue, then: node tools/runner.mjs ratify --all`);
+      return plan;
+    }
+    if (plan.problems.length) {
+      console.error(`\nsync: ${plan.problems.length} problem(s); nothing enqueued (fix or remove the offending observation).`);
+      return plan;
+    }
+    const { queuedCount, runManifestPath } = applySync(ROOT, plan, {});
+    console.log(`sync: ${queuedCount} claim(s) enqueued for ratification; ${plan.duplicates.length} duplicate(s) skipped. Manifest: ${runManifestPath}`);
+    if (queuedCount) console.log(`Review: node tools/runner.mjs ratify --all   (or --id <clm-...>)`);
+    return plan;
+  };
+
+  if (!opts.watch) {
+    const plan = runOnce();
+    process.exit(opts.apply && plan.problems.length ? 1 : 0);
+  }
+
+  // --watch: debounced re-run on observation-drop changes. Zero-dep fs.watch.
+  const dir = path.join(ROOT, OBSERVATIONS_DIR);
+  fs.mkdirSync(dir, { recursive: true });
+  console.error(`sync --watch: watching ${OBSERVATIONS_DIR}/ (Ctrl-C to stop).`);
+  runOnce();
+  let timer = null;
+  fs.watch(dir, { persistent: true }, () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { try { runOnce(); } catch (e) { console.error(`sync error: ${e.message}`); } }, 300);
+  });
+}
+
+function runRatify(opts) {
+  if (!opts.all && opts.ids.length === 0) {
+    console.error("ratify: specify --all or one/more --id <obs_id|claim_id>. Add --discard to drop instead of promote.");
+    process.exit(1);
+  }
+  const plan = planRatify(ROOT, { ids: opts.ids, all: opts.all });
+  for (const p of plan.problems) console.error(`FAIL ${p.id}: ${p.msg}`);
+  if (plan.promote.length === 0) {
+    console.log("ratify: nothing to promote (queue empty or no match).");
+    process.exit(plan.problems.length ? 1 : 0);
+  }
+  const verb = opts.discard ? "discard" : "promote";
+  if (!opts.apply) {
+    console.log(`ratify (dry-run): would ${verb} ${plan.promote.length} claim(s):`);
+    for (const p of plan.promote) console.log(`  ${p.claim.id} -> ${opts.discard ? "discarded" : p.target}  (${p.claim.confidence}, ${p.claim.classification})`);
+    console.log(`\nRe-run with --apply to ${verb}.`);
+    process.exit(plan.problems.length ? 1 : 0);
+  }
+  const { appended, discarded } = applyRatify(ROOT, plan, { discard: opts.discard });
+  if (opts.discard) {
+    console.log(`ratify: discarded ${discarded} queued claim(s).`);
+  } else {
+    for (const a of appended) console.log(`ratified ${a.id} -> ${a.target}`);
+    generateAll(ROOT, { check: false }); // refresh views to reflect new canon
+    console.log(`\nratify: ${appended.length} claim(s) promoted to canon; views regenerated.`);
+  }
+  process.exit(0);
+}
+
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === import.meta.filename;
 if (isMain) {
   const [cmd, ...rest] = process.argv.slice(2);
   const opts = parseArgs(rest);
   if (cmd === "project") runProject(opts);
   else if (cmd === "capture") runCapture(opts);
+  else if (cmd === "sync") runSync(opts);
+  else if (cmd === "ratify") runRatify(opts);
   else {
-    console.error("Usage:\n  runner.mjs project [--entity <id>]... [--adapter gpt|gemini] [-o <file>] [--include-private -o <private/path>]\n  runner.mjs capture <envelope.jsonl> [--apply]");
+    console.error([
+      "Usage:",
+      "  runner.mjs project [--entity <id>]... [--adapter gpt|gemini] [-o <file>] [--include-private -o <private/path>]",
+      "  runner.mjs capture <envelope.jsonl> [--apply]",
+      "  runner.mjs sync [--apply] [--watch]                 # observe inbox/observations/ -> ratification queue",
+      "  runner.mjs ratify (--all | --id <id>...) [--discard] [--apply]   # promote queued claims into canon",
+    ].join("\n"));
     process.exit(1);
   }
 }

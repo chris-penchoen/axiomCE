@@ -1,4 +1,4 @@
-// Tests for the AxiomCE continuity runner (project + capture).
+// Tests for the AxiomCE continuity runner (project + capture + sync + ratify).
 // Node's built-in runner only. No external services, database, or network.
 // Run with:  node --test "tools/*.test.mjs"
 
@@ -15,6 +15,13 @@ import {
   captureContract,
   planCapture,
   applyCapture,
+  candidateHash,
+  loadLedger,
+  loadQueue,
+  planSync,
+  applySync,
+  planRatify,
+  applyRatify,
 } from "./runner.mjs";
 
 function tmpDir() {
@@ -259,4 +266,137 @@ test("applyCapture appends append-only and is re-readable", () => {
   assert.equal(JSON.parse(lines[1]).id, "clm-fix-0002");
   // No BOM.
   assert.notEqual(fs.readFileSync(logPath, "utf8").charCodeAt(0), 0xfeff);
+});
+
+// --- sync (continuous ingest) ---
+function observe(dir, name, lines) {
+  return write(dir, path.join("inbox", "observations", name),
+    lines.map((l) => (typeof l === "string" ? l : JSON.stringify(l))).join("\n") + "\n");
+}
+function obsClaim(over = {}) {
+  return { id_domain: "fix", entity: "organization:fix", predicate: "p", value: "v",
+    confidence: "user-stated", classification: "personal", valid_from: "2026-07-15", source: "s", ...over };
+}
+
+test("candidateHash ignores id/asserted_at but changes with semantic content", () => {
+  const base = obsClaim();
+  delete base.id_domain;
+  const h1 = candidateHash({ ...base, id: "clm-fix-9", asserted_at: "2026-01-01T00:00:00Z" });
+  const h2 = candidateHash({ ...base, id: "clm-zzz-1", asserted_at: "2030-12-31T00:00:00Z" });
+  assert.equal(h1, h2); // minted fields don't affect the hash
+  assert.notEqual(h1, candidateHash({ ...base, value: "different" }));
+  assert.match(h1, /^obs-[0-9a-f]{16}$/);
+});
+
+test("planSync queues new candidates and routes private vs public targets", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  write(dir, "private/entities/sedan.md", entityFile("vehicle:sedan-01", "restricted"));
+  observe(dir, "obs1.jsonl", [
+    obsClaim({ id_domain: "fix", predicate: "p1", value: "v1" }),
+    obsClaim({ id_domain: "sedan", entity: "vehicle:sedan-01", predicate: "p2", value: "v2", classification: "restricted" }),
+  ]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(plan.problems.length, 0);
+  assert.equal(plan.queued.length, 2);
+  const pub = plan.queued.find((q) => !q.private);
+  const prv = plan.queued.find((q) => q.private);
+  assert.equal(pub.target, path.join("claims", "organization-fix.jsonl"));
+  assert.equal(prv.target, path.join("private", "claims", "vehicle-sedan-01.jsonl"));
+});
+
+test("applySync + planSync are idempotent (ledger dedup makes re-runs no-ops)", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [obsClaim({ predicate: "p1", value: "v1" })]);
+  const plan1 = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(plan1.queued.length, 1);
+  applySync(dir, plan1, { now: "2026-07-15T00:00:00.000Z" });
+  const plan2 = planSync(dir, { now: "2026-07-15T00:00:01Z" });
+  assert.equal(plan2.queued.length, 0);
+  assert.equal(plan2.duplicates.length, 1);
+});
+
+test("applySync routes queue/ledger public vs private and writes a value-free run manifest", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  write(dir, "private/entities/sedan.md", entityFile("vehicle:sedan-01", "restricted"));
+  observe(dir, "obs1.jsonl", [
+    obsClaim({ id_domain: "fix", predicate: "p1", value: "v1" }),
+    obsClaim({ id_domain: "sedan", entity: "vehicle:sedan-01", predicate: "p2", value: "SENSITIVEVAL", classification: "restricted" }),
+  ]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  const res = applySync(dir, plan, { now: "2026-07-15T00:00:00.000Z" });
+  assert.equal(res.queuedCount, 2);
+
+  const pubQ = fs.readFileSync(path.join(dir, "runtime", "ratification-queue.jsonl"), "utf8").trim().split(/\r?\n/);
+  assert.equal(pubQ.length, 1);
+  assert.equal(JSON.parse(pubQ[0]).claim.entity, "organization:fix");
+  const prvQ = fs.readFileSync(path.join(dir, "private", "runtime", "ratification-queue.jsonl"), "utf8").trim().split(/\r?\n/);
+  assert.equal(prvQ.length, 1);
+  assert.equal(JSON.parse(prvQ[0]).claim.entity, "vehicle:sedan-01");
+
+  // Sensitive VALUE must never appear in a tracked runtime file.
+  assert.ok(!fs.readFileSync(path.join(dir, "runtime", "ledger.jsonl"), "utf8").includes("SENSITIVEVAL"));
+  const manifestAbs = path.join(dir, res.runManifestPath);
+  assert.ok(!fs.readFileSync(manifestAbs, "utf8").includes("SENSITIVEVAL"));
+  assert.equal(JSON.parse(fs.readFileSync(manifestAbs, "utf8")).queued.length, 2);
+});
+
+// --- ratify (human gate) ---
+test("planRatify/applyRatify promote queued claims into canon and clear the queue", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  write(dir, "private/entities/sedan.md", entityFile("vehicle:sedan-01", "restricted"));
+  observe(dir, "obs1.jsonl", [
+    obsClaim({ id_domain: "fix", predicate: "p1", value: "v1" }),
+    obsClaim({ id_domain: "sedan", entity: "vehicle:sedan-01", predicate: "p2", value: "v2", classification: "restricted" }),
+  ]);
+  applySync(dir, planSync(dir, { now: "2026-07-15T00:00:00Z" }), { now: "2026-07-15T00:00:00.000Z" });
+
+  const plan = planRatify(dir, { all: true });
+  assert.equal(plan.promote.length, 2);
+  const { appended } = applyRatify(dir, plan, { now: "2026-07-15T01:00:00Z" });
+  assert.equal(appended.length, 2);
+
+  const fixLog = fs.readFileSync(path.join(dir, "claims", "organization-fix.jsonl"), "utf8").trim().split(/\r?\n/);
+  assert.equal(fixLog.length, 2); // original + promoted
+  assert.equal(JSON.parse(fixLog[1]).predicate, "p1");
+  const sedanLog = fs.readFileSync(path.join(dir, "private", "claims", "vehicle-sedan-01.jsonl"), "utf8").trim().split(/\r?\n/);
+  assert.equal(JSON.parse(sedanLog[0]).predicate, "p2");
+
+  assert.equal(loadQueue(dir).length, 0);
+  for (const [, e] of loadLedger(dir)) assert.equal(e.status, "ratified");
+});
+
+test("applyRatify --discard removes from queue without touching canon", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [obsClaim({ predicate: "p1", value: "v1" })]);
+  applySync(dir, planSync(dir, { now: "2026-07-15T00:00:00Z" }), { now: "2026-07-15T00:00:00.000Z" });
+  const before = fs.readFileSync(path.join(dir, "claims", "organization-fix.jsonl"), "utf8");
+
+  const { appended, discarded } = applyRatify(dir, planRatify(dir, { all: true }), { discard: true, now: "2026-07-15T02:00:00Z" });
+  assert.equal(appended.length, 0);
+  assert.equal(discarded, 1);
+  assert.equal(fs.readFileSync(path.join(dir, "claims", "organization-fix.jsonl"), "utf8"), before); // canon untouched
+  assert.equal(loadQueue(dir).length, 0);
+  for (const [, e] of loadLedger(dir)) assert.equal(e.status, "discarded");
+});
+
+test("planRatify --id selects a subset and reports unknown ids", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [
+    obsClaim({ predicate: "p1", value: "v1" }),
+    obsClaim({ predicate: "p2", value: "v2" }),
+  ]);
+  applySync(dir, planSync(dir, { now: "2026-07-15T00:00:00Z" }), { now: "2026-07-15T00:00:00.000Z" });
+
+  const plan = planRatify(dir, { ids: ["clm-fix-0002"] });
+  assert.equal(plan.promote.length, 1);
+  assert.equal(plan.promote[0].claim.id, "clm-fix-0002");
+  const bad = planRatify(dir, { ids: ["clm-nope-9999"] });
+  assert.equal(bad.promote.length, 0);
+  assert.ok(bad.problems.some((p) => /not found/.test(p.msg)));
 });
