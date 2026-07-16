@@ -3,49 +3,52 @@ title: Roadmap and Research Questions
 type: framework
 classification: public
 status: public-preview
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 # Roadmap and Research Questions
 
 The AxiomCE roadmap is evidence-driven rather than feature-driven.
 
-## Near-term
+AxiomCE has already been extracted as a public framework (see [CURRENT_STATUS.md](CURRENT_STATUS.md)). The open question is not *whether* extraction is possible, but *whether the extracted framework is production-ready*.
 
-- Expand from 5 to at least 20 meaningful calibration cases.
-- Cover architecture, research, writing, scripting, planning, and operational troubleshooting.
+## Near-term: Hardening the Extracted Framework
+
+- Audit and document all privacy boundaries for external use.
+- Expand the sample beyond one calibration case to show multiple scenarios.
+- Write external-adopter documentation (setup, extending schemas, integrating with other tools).
+- Run the framework on 2–3 external test projects (with consent) to catch integration issues.
+- Validate that schemas are stable and tolerate real-world variations.
+- Confirm privacy properties hold under different data-sensitivity levels.
+
+## Medium-term: Expanding Evidence
+
+- Expand calibration corpus from 5 to 20+ meaningful cases.
+- Cover diverse task domains: architecture, research, writing, scripting, planning, operational troubleshooting.
 - Repeat cross-model comparisons across multiple cases and model families.
+- Measure human cleanup required per model and task.
 - Human-ratify useful evaluation observations.
 - Confirm whether thin adapters measurably reduce model-specific failure modes.
-- Audit privacy boundaries before any public framework extraction.
 
-## Medium-term
-
-- Define policy supersession and retirement.
-- Add evaluation-record schemas.
-- Measure human cleanup required per model and task.
-- Test compact bootstrap versus full policy loading.
-- Detect behavioral drift across model versions.
-- Generate sanitized public examples from private canonical structures.
-
-## Long-term questions
+## Long-term: Core Research Questions
 
 - How much collaboration judgment is genuinely portable?
-- Which preferences remain stable across domains?
+- Which preferences remain stable across domains and model families?
 - How many calibration cases are needed before a policy becomes predictive?
 - When is a failure about the human model versus the AI model?
-- Can model adapters be generated from repeated evidence?
-- How should privacy classifications propagate into generated views and prompts?
-- Can a reusable framework (AxiomCE) be separated cleanly from a private personal instance?
+- Can model adapters be generated from repeated evidence rather than hand-tuned?
+- How should privacy classifications propagate into generated views and external prompts?
+- What is the shelf-life of a calibration case? Does behavior drift require periodic re-calibration?
 
-## Public framework threshold
+## Framework Readiness Threshold
 
-A public framework should not be extracted merely because the private prototype is interesting.
+The framework is suitable for external use when:
 
-It should wait until:
+- ✅ Extraction is complete and schemas are stable (done).
+- ✅ Privacy boundaries are clearly defined (done).
+- ❓ External testing validates usability without framework changes (in progress).
+- ❓ Sample documentation is clear and complete (in progress).
+- ❓ Governance patterns are well-documented for extension (partial).
+- ⏳ Privacy audit is complete and published (pending).
 
-- schemas have survived real use;
-- privacy boundaries have been audited;
-- examples can be fully sanitized;
-- the adapter and calibration model has repeatable evidence;
-- and framework code can be separated from private personal content without ambiguity.
+Roadmap priorities will shift based on early external feedback.

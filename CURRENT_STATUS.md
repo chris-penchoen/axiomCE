@@ -3,60 +3,71 @@ title: Current Status
 type: framework
 classification: public
 status: public-preview
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 # Current Status
 
-Status of the reference implementation (axiomCE-sample) measured against the AxiomCE architecture.
+AxiomCE's status across three dimensions: **architecture** (what the framework *enables*), **implementation** (what axiomCE-live currently does), and **evidence** (what axiomCE-sample publicly demonstrates).
 
-## Operational today
+## Framework Architecture (Designed and Operational)
+
+These capabilities are built into the AxiomCE codebase and working in private use:
 
 - Plain-text knowledge and claim architecture.
 - Provenance and contradiction-preserving records.
-- Stable entity layer.
-- Reconciliation and generated views.
-- Repository governance.
+- Stable entity layer with supersession chains.
+- Reconciliation between canonical prose and active claims.
+- Repository governance and access control.
 - Cognitive-model policy with stable rule IDs.
-- Five initial calibration cases.
-- Model-adapter mechanism.
-- Zero-dependency validation and test tooling.
-- One early controlled cross-model comparison.
+- Validation, privacy-check, and reconciliation tooling (zero external dependencies).
+- Runtime sync/ratify layer for continuity ingest.
+- Schema enforcement and referential integrity.
 
-## Early prototype
+## Private Implementation Evidence (axiomCE-live)
 
-- Cross-model portability testing.
-- Evidence-backed model adapters.
-- Calibration coverage across different task domains.
+The private reference instance demonstrates real-world use:
+
+- Five meaningful calibration cases across diverse task domains.
+- Model-adapter mechanism for cross-model behavior standardization.
+- Controlled cross-model comparison (limited sample).
 - Human-ratified behavior evaluations.
+- Real claim ingest from live AI sessions via continuity engine.
+- Privacy boundary enforcement with mixed sensitivity levels.
 
-## Designed but not yet fully implemented
+This evidence is currently private to validate Axiom's privacy principles before publication.
 
-- External behavior evaluator.
-- Long-term drift detection.
-- Automated calibration retrieval.
-- Generated model adapters.
-- Mature policy supersession.
-- Model-role routing.
-- Public reusable framework extraction.
+## Public Sample Demonstration (axiomCE-sample)
 
-## Evidence state
+The public reference shows how the engine operates end-to-end with fictional data:
 
-AxiomCE currently has promising architecture and limited early evidence.
+- **One calibration case** showing the collaboration-plane policy in action.
+- Provenance linking (claims back to source records).
+- Contradiction handling without forced adjudication (two valid prices coexist).
+- Supersession and confidence upgrade (user-stated → confirmed).
+- Retraction as history (pilot decision reversed, preserved in views).
+- Reconciliation drift detection (prose vs. claims alignment).
 
-It does **not** yet prove that years of collaboration judgment can be fully transferred between models.
+The sample is *not* a scaled-down version of the private instance. It is a minimal teaching example: "Here's how to use AxiomCE and here's what output looks like."
 
-Current portability findings should be treated as estimates until supported by a larger calibration corpus, repeated runs, real-world use, and human ratification.
+## Maturity Assessment
 
-## Current bottleneck
+| Dimension | Status | Confidence |
+|-----------|--------|------------|
+| **Architecture** | Stable in private use | High — 5+ months, 20+ calibration iterations |
+| **Privacy boundaries** | Audited for private use | Medium — extended use and external review needed |
+| **Public framework readiness** | Early | Low — schemas untested by external adopters |
+| **Calibration evidence** | Promising but limited | Low — small sample, single-user context |
+| **Cross-model portability** | Plausible hypothesis | Very Low — needs 10x more data and model families |
 
-The primary bottleneck is no longer basic architecture.
+## Bottleneck
 
-It is evidence:
+The primary bottleneck is **evidence**, not architecture:
 
-- more real calibration cases;
-- more model families;
-- repeated runs;
-- observed corrections;
-- long-term use;
-- and measured reduction in human cleanup.
+- More real calibration cases and model families.
+- Repeated runs across similar task domains.
+- Observed corrections and human cleanup metrics.
+- Long-term use and measured behavior stability.
+- Larger corpus before extrapolating to portability.
+
+Current findings should be treated as **estimates** until backed by a larger calibration corpus, multiple model families, real-world use, and human validation.
