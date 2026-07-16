@@ -285,7 +285,7 @@ test("candidateHash ignores id/asserted_at but changes with semantic content", (
   const h2 = candidateHash({ ...base, id: "clm-zzz-1", asserted_at: "2030-12-31T00:00:00Z" });
   assert.equal(h1, h2); // minted fields don't affect the hash
   assert.notEqual(h1, candidateHash({ ...base, value: "different" }));
-  assert.match(h1, /^obs-[0-9a-f]{16}$/);
+  assert.match(h1, /^obs-[0-9a-f]{32}$/);
 });
 
 test("planSync queues new candidates and routes private vs public targets", () => {
@@ -339,8 +339,25 @@ test("applySync routes queue/ledger public vs private and writes a value-free ru
   // Sensitive VALUE must never appear in a tracked runtime file.
   assert.ok(!fs.readFileSync(path.join(dir, "runtime", "ledger.jsonl"), "utf8").includes("SENSITIVEVAL"));
   const manifestAbs = path.join(dir, res.runManifestPath);
+  const trackedManifest = JSON.parse(fs.readFileSync(manifestAbs, "utf8"));
+  // The tracked manifest carries PUBLIC items only (no values, no filenames,
+  // no private identifiers) — the private item is reduced to a bare count.
   assert.ok(!fs.readFileSync(manifestAbs, "utf8").includes("SENSITIVEVAL"));
-  assert.equal(JSON.parse(fs.readFileSync(manifestAbs, "utf8")).queued.length, 2);
+  assert.equal(trackedManifest.queued.length, 1);
+  assert.match(trackedManifest.queued[0].claim_id, /^clm-fix-/);
+  assert.equal(trackedManifest.private_queued_count, 1);
+  // The tracked manifest must not name the private entity/target or source file.
+  const trackedText = fs.readFileSync(manifestAbs, "utf8");
+  assert.ok(!trackedText.includes("vehicle-sedan-01"));
+  assert.ok(!trackedText.includes("obs1.jsonl"));
+  // Private identifiers/targets/filenames live only in the git-excluded
+  // private detailed manifest.
+  const privManifestAbs = path.join(dir, "private", "runtime", "runs", path.basename(res.runManifestPath));
+  assert.ok(fs.existsSync(privManifestAbs));
+  const privManifest = JSON.parse(fs.readFileSync(privManifestAbs, "utf8"));
+  assert.equal(privManifest.private_queued.length, 1);
+  assert.equal(privManifest.private_queued[0].target, path.join("private", "claims", "vehicle-sedan-01.jsonl"));
+  assert.deepEqual(privManifest.observed_files, ["obs1.jsonl"]);
 });
 
 // --- ratify (human gate) ---
@@ -400,3 +417,71 @@ test("planRatify --id selects a subset and reports unknown ids", () => {
   assert.equal(bad.promote.length, 0);
   assert.ok(bad.problems.some((p) => /not found/.test(p.msg)));
 });
+
+// --- hardening: idempotency, crash-recovery, corruption, concurrency ---
+
+test("candidateHash distinguishes retraction state (retracted_at is in the hash)", () => {
+  const base = obsClaim();
+  delete base.id_domain;
+  const live = candidateHash({ ...base, retracted_at: null });
+  const dead = candidateHash({ ...base, retracted_at: "2026-08-01T00:00:00Z" });
+  assert.notEqual(live, dead);
+});
+
+test("evaluateCandidate rejects an externally-supplied claim id that already exists in canon", () => {
+  const dir = tmpDir();
+  seedStore(dir); // canon already has clm-fix-0001
+  observe(dir, "obs1.jsonl", [obsClaim({ id: "clm-fix-0001", predicate: "dup", value: "x" })]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(plan.queued.length, 0);
+  assert.ok(plan.problems.some((p) => /duplicate claim id/.test(p.msg)));
+});
+
+test("applySync apply-time idempotency: a crash-replayed plan does not double-queue", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [obsClaim({ predicate: "p1", value: "v1" })]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(plan.queued.length, 1);
+  // First apply enqueues; replaying the SAME plan object (as a crash-retry
+  // would) must be a no-op because the obs_id is already in the ledger/queue.
+  const first = applySync(dir, plan, { now: "2026-07-15T00:00:00.000Z" });
+  assert.equal(first.queuedCount, 1);
+  const second = applySync(dir, plan, { now: "2026-07-15T00:00:01.000Z" });
+  assert.equal(second.queuedCount, 0);
+  assert.equal(loadQueue(dir).length, 1);
+});
+
+test("applyRatify is idempotent by claim id (crash after canon append, before queue removal)", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [obsClaim({ predicate: "p1", value: "v1" })]);
+  applySync(dir, planSync(dir, { now: "2026-07-15T00:00:00Z" }), { now: "2026-07-15T00:00:00.000Z" });
+  const plan = planRatify(dir, { all: true });
+  const claimId = plan.promote[0].claim.id;
+
+  // Simulate a prior ratification that appended to canon but crashed before
+  // clearing the queue: pre-append the exact claim to its canon log.
+  const canonAbs = path.join(dir, "claims", "organization-fix.jsonl");
+  fs.appendFileSync(canonAbs, JSON.stringify(plan.promote[0].claim) + "\n");
+  const linesBefore = fs.readFileSync(canonAbs, "utf8").trim().split(/\r?\n/).length;
+
+  const res = applyRatify(dir, plan, { now: "2026-07-15T01:00:00Z" });
+  assert.equal(res.alreadyCanon, 1);       // detected, not re-appended
+  assert.equal(res.appended.length, 0);
+  const linesAfter = fs.readFileSync(canonAbs, "utf8").trim().split(/\r?\n/).length;
+  assert.equal(linesAfter, linesBefore);   // canon not double-appended
+  assert.equal(loadQueue(dir).length, 0);  // queue still reconciled
+  assert.ok(fs.readFileSync(canonAbs, "utf8").split(claimId).length - 1 === 1); // exactly one copy
+});
+
+test("loadQueue/loadLedger throw loudly on a corrupt operational line (never silently skip)", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [obsClaim({ predicate: "p1", value: "v1" })]);
+  applySync(dir, planSync(dir, { now: "2026-07-15T00:00:00Z" }), { now: "2026-07-15T00:00:00.000Z" });
+  const qp = path.join(dir, "runtime", "ratification-queue.jsonl");
+  fs.appendFileSync(qp, "{ this is not valid json\n");
+  assert.throws(() => loadQueue(dir), /corrupt operational JSONL/);
+});
+

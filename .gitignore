@@ -4,6 +4,17 @@
 private/
 !private/.gitkeep
 
+# --- Sensitive observation ingress: a candidate may be private BEFORE the
+#     runner classifies it, so keep the whole inbox out of the tree (privacy
+#     boundary at ingress). Keep the dir itself so `sync --watch` has a target.
+inbox/observations/*
+!inbox/observations/.gitkeep
+
+# --- Runtime writer lock + atomic-write temp files (never commit) ---
+runtime/writer.lock
+private/runtime/writer.lock
+*.tmp-*
+
 # --- Never-store safety nets (should never be created, but block anyway) ---
 *.pem
 *.key

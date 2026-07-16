@@ -30,6 +30,7 @@
 // See kernel/BOOT.md and kernel/ontology.yaml for the layer/precedence contract.
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 
@@ -63,8 +64,9 @@ function runtimePaths(root = ROOT, isPrivate = false) {
     dir: base,
     ledger: path.join(base, "ledger.jsonl"),
     queue: path.join(base, "ratification-queue.jsonl"),
-    // Run manifests are always tracked — they carry ids/counts, never values.
-    runs: path.join(root, "runtime", "runs"),
+    // Tracked run manifests carry public ids/counts only; private detail goes
+    // to private/runtime/runs (git-excluded), routed by `isPrivate`.
+    runs: path.join(base, "runs"),
   };
 }
 
@@ -85,39 +87,117 @@ export function candidateHash(obj) {
     classification: obj.classification ?? null,
     valid_from: obj.valid_from ?? null,
     valid_to: obj.valid_to ?? null,
+    retracted_at: obj.retracted_at ?? null,
     supersedes: obj.supersedes ?? null,
     note: obj.note ?? null,
     source: obj.source ?? null,
   };
   const canon = JSON.stringify(semantic, Object.keys(semantic).sort());
-  return "obs-" + crypto.createHash("sha256").update(canon).digest("hex").slice(0, 16);
+  return "obs-" + crypto.createHash("sha256").update(canon).digest("hex").slice(0, 32);
 }
 
-/** Read a JSONL file into parsed objects (skips blank/`//` lines). */
+/**
+ * Read a JSONL file into parsed objects (skips blank/`//` lines). Operational
+ * files (ledger/queue/canon) are machine-written, so a malformed line means
+ * corruption — surface it loudly rather than silently forgetting state.
+ */
 function readJsonl(abs) {
   if (!fs.existsSync(abs)) return [];
   const out = [];
-  fs.readFileSync(abs, "utf8").split(/\r?\n/).forEach((raw) => {
+  const lines = fs.readFileSync(abs, "utf8").split(/\r?\n/);
+  lines.forEach((raw, i) => {
     const t = raw.trim();
     if (!t || t.startsWith("//")) return;
-    try { out.push(JSON.parse(t)); } catch { /* skip malformed operational line */ }
+    try {
+      out.push(JSON.parse(t));
+    } catch (e) {
+      throw new Error(`corrupt operational JSONL at ${abs}:${i + 1} — ${e.message} (recover/repair before continuing; malformed audit state is never silently skipped)`);
+    }
   });
   return out;
 }
 
-/** Append objects to a JSONL file (UTF-8, no BOM), creating dirs as needed. */
-function appendJsonl(abs, objs) {
-  if (!objs.length) return;
+/**
+ * Write a file atomically: write to a temp sibling, fsync, then rename over the
+ * target. Rename is atomic on a single filesystem, so a crash mid-write can
+ * never leave a truncated/partial file — readers see either the old or the new
+ * complete content. Creates parent dirs as needed. UTF-8, no BOM.
+ */
+function atomicWrite(abs, content) {
   fs.mkdirSync(path.dirname(abs), { recursive: true });
-  let existing = fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
-  if (existing && !existing.endsWith("\n")) existing += "\n";
-  fs.writeFileSync(abs, existing + objs.map((o) => JSON.stringify(o)).join("\n") + "\n", { encoding: "utf8" });
+  const tmp = `${abs}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const fd = fs.openSync(tmp, "w");
+  try {
+    fs.writeFileSync(fd, content, { encoding: "utf8" });
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, abs);
 }
 
-/** Overwrite a JSONL file with the given objects (used to rewrite the queue). */
+/** Append objects to a JSONL file (append-only, atomic), creating dirs. */
+function appendJsonl(abs, objs) {
+  if (!objs.length) return;
+  let existing = fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+  if (existing && !existing.endsWith("\n")) existing += "\n";
+  atomicWrite(abs, existing + objs.map((o) => JSON.stringify(o)).join("\n") + "\n");
+}
+
+/** Overwrite a JSONL file with the given objects (atomic; rewrites the queue). */
 function writeJsonl(abs, objs) {
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  fs.writeFileSync(abs, objs.length ? objs.map((o) => JSON.stringify(o)).join("\n") + "\n" : "", { encoding: "utf8" });
+  atomicWrite(abs, objs.length ? objs.map((o) => JSON.stringify(o)).join("\n") + "\n" : "");
+}
+
+/** True if a PID is live on this host (best-effort; EPERM still means alive). */
+function isPidAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
+/**
+ * Run `fn` while holding an exclusive runtime writer lock. All state-changing
+ * operations (sync apply, ratify apply, privileged import) share this single
+ * lock so concurrent processes cannot interleave read-modify-write on the
+ * ledger/queue/canon. Zero-dependency: an O_EXCL lockfile under runtime/.
+ * Recovers a stale lock only when its owning PID is dead or it has aged out.
+ */
+function withWriterLock(root, fn) {
+  const lockPath = path.join(root, "runtime", "writer.lock");
+  const STALE_MS = 60_000;
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+
+  if (fs.existsSync(lockPath)) {
+    let stale = false;
+    try {
+      const info = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      const age = Date.now() - new Date(info.acquired_at).getTime();
+      const sameHostAlive = info.host === os.hostname() && isPidAlive(info.pid);
+      stale = !sameHostAlive || age > STALE_MS;
+    } catch { stale = true; }
+    if (stale) { try { fs.rmSync(lockPath, { force: true }); } catch { /* race: reacquire below */ } }
+  }
+
+  let fd;
+  try {
+    fd = fs.openSync(lockPath, "wx"); // exclusive create — fails if held
+  } catch (e) {
+    if (e.code === "EEXIST") {
+      throw new Error("runtime is locked by another writer (runtime/writer.lock). Wait for it to finish, or remove the lock if you are sure it is stale.");
+    }
+    throw e;
+  }
+  try {
+    fs.writeSync(fd, JSON.stringify({ pid: process.pid, host: os.hostname(), acquired_at: new Date().toISOString(), cmd: process.argv.slice(2).join(" ") }));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try {
+    return fn();
+  } finally {
+    try { fs.rmSync(lockPath, { force: true }); } catch { /* best-effort release */ }
+  }
 }
 
 /**
@@ -437,6 +517,15 @@ export function evaluateCandidate(obj, ctx) {
     const minted = nextClaimId([...known, ...mintedIds.map((id) => ({ id }))], idDomain);
     obj.id = minted;
     mintedIds.push(minted);
+  } else {
+    // Externally-supplied id: enforce uniqueness NOW against canon, queued, and
+    // ids minted/seen earlier in this batch — otherwise a duplicate canonical id
+    // could slip through and only be caught by the whole-store validator later.
+    const clash = known.some((k) => k.id === obj.id) || mintedIds.includes(obj.id);
+    if (clash) {
+      problems.push(`duplicate claim id: ${obj.id} (already present in canon, the ratification queue, or earlier in this batch)`);
+    }
+    mintedIds.push(obj.id);
   }
   if (!obj.asserted_at) obj.asserted_at = now;
 
@@ -553,12 +642,10 @@ export function applyCapture(root, planned) {
   }
   for (const [rel, claims] of byTarget) {
     const abs = path.join(root, rel);
-    fs.mkdirSync(path.dirname(abs), { recursive: true });
     let existing = fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
     if (existing && !existing.endsWith("\n")) existing += "\n";
     const additions = claims.map((c) => JSON.stringify(c)).join("\n") + "\n";
-    // UTF-8, no BOM.
-    fs.writeFileSync(abs, existing + additions, { encoding: "utf8" });
+    atomicWrite(abs, existing + additions); // temp+fsync+rename; UTF-8, no BOM
     for (const c of claims) appended.push({ id: c.id, target: rel });
   }
   return { appended };
@@ -660,9 +747,21 @@ export function applySync(root = ROOT, plan, opts = {}) {
   const pub = runtimePaths(root, false);
   const prv = runtimePaths(root, true);
 
+  // Apply-time idempotency (belt-and-suspenders vs a crash between the queue and
+  // ledger writes of a prior run): re-read the ledger + live queue NOW and drop
+  // any candidate whose obs_id is already recorded, so a re-run cannot enqueue a
+  // duplicate under a fresh claim id.
+  const seen = new Set();
+  for (const isPrivate of [false, true]) {
+    const rp = runtimePaths(root, isPrivate);
+    for (const rec of readJsonl(rp.ledger)) if (rec.obs_id) seen.add(rec.obs_id);
+    for (const q of readJsonl(rp.queue)) if (q.obs_id) seen.add(q.obs_id);
+  }
+  const fresh = plan.queued.filter((q) => !seen.has(q.obs_id));
+
   const queueBucket = { false: [], true: [] };
   const ledgerBucket = { false: [], true: [] };
-  for (const q of plan.queued) {
+  for (const q of fresh) {
     const key = String(q.private);
     queueBucket[key].push({
       obs_id: q.obs_id,
@@ -688,20 +787,43 @@ export function applySync(root = ROOT, plan, opts = {}) {
   appendJsonl(prv.queue, queueBucket["true"]);
   appendJsonl(prv.ledger, ledgerBucket["true"]);
 
-  // Run manifest — tracked; carries ids/targets/counts, never claim values.
-  const manifest = {
+  // Manifests are split by privacy so the TRACKED record can never leak private
+  // identifiers, targets, or source filenames:
+  //  - tracked runtime/runs/<stamp>.json  : aggregate counts + PUBLIC items only
+  //  - private/runtime/runs/<stamp>.json  : full detail incl. observed files +
+  //    private items (git-excluded).
+  const publicItems = fresh.filter((q) => !q.private)
+    .map((q) => ({ obs_id: q.obs_id, claim_id: q.claim.id, target: q.target }));
+  const privateItems = fresh.filter((q) => q.private)
+    .map((q) => ({ obs_id: q.obs_id, claim_id: q.claim.id, target: q.target }));
+
+  const trackedManifest = {
     run: stamp,
     generator: "tools/runner.mjs sync",
-    observed_files: plan.files,
-    queued: plan.queued.map((q) => ({ obs_id: q.obs_id, claim_id: q.claim.id, target: q.target, private: q.private })),
+    queued: publicItems,                 // public only — never claim values
+    private_queued_count: privateItems.length,
     duplicates: plan.duplicates.length,
     problems: plan.problems.length,
   };
   const runPath = path.join(pub.runs, `${stamp}.json`);
-  fs.mkdirSync(path.dirname(runPath), { recursive: true });
-  fs.writeFileSync(runPath, JSON.stringify(manifest, null, 2) + "\n", { encoding: "utf8" });
+  atomicWrite(runPath, JSON.stringify(trackedManifest, null, 2) + "\n");
 
-  return { queuedCount: plan.queued.length, runManifestPath: path.relative(root, runPath) };
+  // Private detailed manifest — only when there is private detail to record.
+  if (privateItems.length || plan.files.length) {
+    const privateManifest = {
+      run: stamp,
+      generator: "tools/runner.mjs sync",
+      observed_files: plan.files,        // filenames can reveal people/projects
+      public_queued: publicItems,
+      private_queued: privateItems,
+      duplicates: plan.duplicates.length,
+      problems: plan.problems.length,
+    };
+    const privRunPath = path.join(prv.runs, `${stamp}.json`);
+    atomicWrite(privRunPath, JSON.stringify(privateManifest, null, 2) + "\n");
+  }
+
+  return { queuedCount: fresh.length, runManifestPath: path.relative(root, runPath) };
 }
 
 // ---------------------------------------------------------------------------
@@ -746,12 +868,33 @@ export function applyRatify(root = ROOT, plan, opts = {}) {
   const now = opts.now || new Date().toISOString();
   const discard = !!opts.discard;
 
-  let appended = [];
+  // Idempotent-by-claim-id: if a prior ratification crashed AFTER appending to
+  // canon but BEFORE removing the queue entry, re-running must not append the
+  // same claim twice. Skip promotes whose claim.id is already present in the
+  // target canon file — but still remove them from the queue and record the
+  // transition, so the crash-interrupted step completes cleanly on retry.
+  let promote = plan.promote;
+  let alreadyCanon = [];
   if (!discard) {
-    ({ appended } = applyCapture(root, plan.promote.map((p) => ({ target: p.target, claim: p.claim }))));
+    const canonIds = new Map(); // target rel -> Set of ids present
+    const idsFor = (target) => {
+      if (!canonIds.has(target)) {
+        const abs = path.join(root, target);
+        canonIds.set(target, new Set(readJsonl(abs).map((c) => c.id)));
+      }
+      return canonIds.get(target);
+    };
+    alreadyCanon = plan.promote.filter((p) => idsFor(p.target).has(p.claim.id));
+    promote = plan.promote.filter((p) => !idsFor(p.target).has(p.claim.id));
   }
 
-  // Remove promoted/discarded entries from whichever queue (pub/prv) holds them.
+  let appended = [];
+  if (!discard && promote.length) {
+    ({ appended } = applyCapture(root, promote.map((p) => ({ target: p.target, claim: p.claim }))));
+  }
+
+  // Remove promoted/discarded entries (including already-canonical ones) from
+  // whichever queue (pub/prv) holds them.
   const doneObs = new Set(plan.promote.map((p) => p.queueEntry.obs_id));
   for (const isPrivate of [false, true]) {
     const qp = runtimePaths(root, isPrivate).queue;
@@ -759,6 +902,8 @@ export function applyRatify(root = ROOT, plan, opts = {}) {
   }
 
   // Append status-transition ledger records (routed by the claim's privacy).
+  // Entries that were already in canon are recorded as ratified too (the
+  // promotion is complete either way), keeping ledger/canon consistent.
   const led = { false: [], true: [] };
   for (const p of plan.promote) {
     const rec = { obs_id: p.queueEntry.obs_id, claim_id: p.claim.id, status: discard ? "discarded" : "ratified" };
@@ -768,7 +913,7 @@ export function applyRatify(root = ROOT, plan, opts = {}) {
   appendJsonl(runtimePaths(root, false).ledger, led["false"]);
   appendJsonl(runtimePaths(root, true).ledger, led["true"]);
 
-  return { appended, discarded: discard ? plan.promote.length : 0 };
+  return { appended, discarded: discard ? plan.promote.length : 0, alreadyCanon: alreadyCanon.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -777,13 +922,14 @@ export function applyRatify(root = ROOT, plan, opts = {}) {
 
 function parseArgs(argv) {
   const out = { _: [], entity: [], adapter: null, includePrivate: false, apply: false, out: null,
-                watch: false, ids: [], all: false, discard: false };
+                watch: false, ids: [], all: false, discard: false, trust: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--entity") out.entity.push(argv[++i]);
     else if (a === "--adapter") out.adapter = argv[++i];
     else if (a === "--include-private") out.includePrivate = true;
     else if (a === "--apply") out.apply = true;
+    else if (a === "--trust") out.trust = true;
     else if (a === "--watch") out.watch = true;
     else if (a === "--id") out.ids.push(argv[++i]);
     else if (a === "--all") out.all = true;
@@ -818,10 +964,19 @@ function runProject(opts) {
   }
 }
 
-function runCapture(opts) {
+function runImportCanonical(opts) {
   const envelope = opts._[0];
   if (!envelope) {
-    console.error("capture: missing <envelope.jsonl>. Usage: runner.mjs capture <envelope.jsonl> [--apply]");
+    console.error("import-canonical: missing <envelope.jsonl>. Usage: runner.mjs import-canonical <envelope.jsonl> --trust [--apply]");
+    process.exit(1);
+  }
+  // This command DELIBERATELY bypasses the ratification queue and writes
+  // straight to canon. It is a privileged administrative import, so it demands
+  // an explicit --trust acknowledgement that the source is authoritative.
+  if (!opts.trust) {
+    console.error("import-canonical writes directly to canon, bypassing human ratification.");
+    console.error("Re-run with --trust to confirm the envelope is an authoritative source.");
+    console.error("For untrusted/model-proposed observations use `sync` instead (routes through the ratification queue).");
     process.exit(1);
   }
   const { planned, problems } = planCapture(ROOT, path.resolve(envelope), {});
@@ -830,18 +985,18 @@ function runCapture(opts) {
     for (const w of p.warns) console.error(`WARN line ${p.line}: ${w}`);
   }
   if (problems.length) {
-    console.error(`\ncapture: ${problems.length} problem(s); nothing written.`);
+    console.error(`\nimport-canonical: ${problems.length} problem(s); nothing written.`);
     process.exit(1);
   }
   if (!opts.apply) {
-    console.log(`capture (dry-run): ${planned.length} claim(s) would be appended:`);
+    console.log(`import-canonical (dry-run): ${planned.length} claim(s) would be written DIRECTLY to canon (bypassing ratification):`);
     for (const p of planned) console.log(`  ${p.claim.id} -> ${p.target}  (${p.claim.confidence}, ${p.claim.classification})`);
-    console.log("\nReview, then re-run with --apply. Captured claims land PENDING human ratification.");
+    console.log("\nRe-run with --apply to write. These claims become canonical immediately — they are NOT queued for ratification.");
     process.exit(0);
   }
-  const { appended } = applyCapture(ROOT, planned);
-  for (const a of appended) console.log(`appended ${a.id} -> ${a.target}`);
-  console.log(`\ncapture: ${appended.length} claim(s) appended. Regenerate views (node tools/generate-views.mjs) and ratify.`);
+  const { appended } = withWriterLock(ROOT, () => applyCapture(ROOT, planned));
+  for (const a of appended) console.log(`imported ${a.id} -> ${a.target} (canonical)`);
+  console.log(`\nimport-canonical: ${appended.length} claim(s) written directly to canon. Regenerate views (node tools/generate-views.mjs).`);
   process.exit(0);
 }
 
@@ -861,7 +1016,7 @@ function runSync(opts) {
       console.error(`\nsync: ${plan.problems.length} problem(s); nothing enqueued (fix or remove the offending observation).`);
       return plan;
     }
-    const { queuedCount, runManifestPath } = applySync(ROOT, plan, {});
+    const { queuedCount, runManifestPath } = withWriterLock(ROOT, () => applySync(ROOT, plan, {}));
     console.log(`sync: ${queuedCount} claim(s) enqueued for ratification; ${plan.duplicates.length} duplicate(s) skipped. Manifest: ${runManifestPath}`);
     if (queuedCount) console.log(`Review: node tools/runner.mjs ratify --all   (or --id <clm-...>)`);
     return plan;
@@ -902,11 +1057,12 @@ function runRatify(opts) {
     console.log(`\nRe-run with --apply to ${verb}.`);
     process.exit(plan.problems.length ? 1 : 0);
   }
-  const { appended, discarded } = applyRatify(ROOT, plan, { discard: opts.discard });
+  const { appended, discarded, alreadyCanon } = withWriterLock(ROOT, () => applyRatify(ROOT, plan, { discard: opts.discard }));
   if (opts.discard) {
     console.log(`ratify: discarded ${discarded} queued claim(s).`);
   } else {
     for (const a of appended) console.log(`ratified ${a.id} -> ${a.target}`);
+    if (alreadyCanon) console.log(`(${alreadyCanon} already in canon from an interrupted run — queue reconciled, not re-appended.)`);
     generateAll(ROOT, { check: false }); // refresh views to reflect new canon
     console.log(`\nratify: ${appended.length} claim(s) promoted to canon; views regenerated.`);
   }
@@ -918,14 +1074,18 @@ if (isMain) {
   const [cmd, ...rest] = process.argv.slice(2);
   const opts = parseArgs(rest);
   if (cmd === "project") runProject(opts);
-  else if (cmd === "capture") runCapture(opts);
+  else if (cmd === "import-canonical") runImportCanonical(opts);
+  else if (cmd === "capture") {
+    console.error("note: `capture` is deprecated and renamed to `import-canonical` (it bypasses ratification; requires --trust).");
+    runImportCanonical(opts);
+  }
   else if (cmd === "sync") runSync(opts);
   else if (cmd === "ratify") runRatify(opts);
   else {
     console.error([
       "Usage:",
       "  runner.mjs project [--entity <id>]... [--adapter gpt|gemini] [-o <file>] [--include-private -o <private/path>]",
-      "  runner.mjs capture <envelope.jsonl> [--apply]",
+      "  runner.mjs import-canonical <envelope.jsonl> --trust [--apply]   # PRIVILEGED: writes straight to canon, bypasses ratification",
       "  runner.mjs sync [--apply] [--watch]                 # observe inbox/observations/ -> ratification queue",
       "  runner.mjs ratify (--all | --id <id>...) [--discard] [--apply]   # promote queued claims into canon",
     ].join("\n"));
