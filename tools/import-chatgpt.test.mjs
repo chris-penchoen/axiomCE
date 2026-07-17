@@ -121,6 +121,31 @@ test("loadExport reads an array file and a directory, and rejects a zip", () => 
   assert.throws(() => loadExport(path.join(dir, "export.zip")), /unzip it first/);
 });
 
+test("loadExport concatenates a sharded export (conversations-NNN.json) in order", () => {
+  const dir = tmpDir();
+  const c = (id) => ({ ...sampleConversation(), conversation_id: id });
+  // Shards out of readdir order; zero-padded names must sort numerically.
+  fs.writeFileSync(path.join(dir, "conversations-010.json"), JSON.stringify([c("k")]));
+  fs.writeFileSync(path.join(dir, "conversations-000.json"), JSON.stringify([c("a"), c("b")]));
+  fs.writeFileSync(path.join(dir, "conversations-002.json"), JSON.stringify([c("c")]));
+  const all = loadExport(dir);
+  assert.equal(all.length, 4);
+  // Numeric shard order preserved: 000(a,b) -> 002(c) -> 010(k).
+  assert.deepEqual(all.map((x) => x.conversation_id), ["a", "b", "c", "k"]);
+});
+
+test("loadExport prefers a single conversations.json over shards when both exist", () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, "conversations.json"), JSON.stringify([sampleConversation()]));
+  fs.writeFileSync(path.join(dir, "conversations-000.json"), JSON.stringify([sampleConversation(), sampleConversation()]));
+  assert.equal(loadExport(dir).length, 1); // single file wins
+});
+
+test("loadExport errors clearly when a directory has neither form", () => {
+  const dir = tmpDir();
+  assert.throws(() => loadExport(dir), /no conversations\.json or conversations-NNN\.json/);
+});
+
 test("importExport writes transcripts + manifest and defaults under private/", () => {
   const dir = tmpDir();
   fs.writeFileSync(path.join(dir, "conversations.json"), JSON.stringify([sampleConversation()]));

@@ -36,7 +36,8 @@
 //        [--min-messages N]       # skip conversations with fewer kept msgs (default 1)
 //
 // The zip from OpenAI must be unzipped first (kept dependency-free on purpose);
-// point this tool at the extracted conversations.json.
+// point this tool at the extracted conversations.json, OR at the directory of a
+// newer sharded export (conversations-000.json, conversations-001.json, ...).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -154,20 +155,8 @@ export function toTranscript(conv, opts = {}) {
   };
 }
 
-/** Parse the export payload (path to conversations.json or a dir) into an array. */
-export function loadExport(inputPath) {
-  let file = inputPath;
-  const stat = fs.existsSync(inputPath) ? fs.statSync(inputPath) : null;
-  if (!stat) throw new Error(`input not found: ${inputPath}`);
-  if (stat.isDirectory()) {
-    file = path.join(inputPath, "conversations.json");
-    if (!fs.existsSync(file)) {
-      throw new Error(`no conversations.json in ${inputPath} (unzip the OpenAI export first, then point here)`);
-    }
-  }
-  if (/\.zip$/i.test(file)) {
-    throw new Error(`got a .zip — unzip it first (this tool is zero-dependency): expand it, then pass the conversations.json inside`);
-  }
+/** Parse one conversations file into an array of conversations. */
+export function parseConversationsFile(file) {
   const raw = fs.readFileSync(file, "utf8");
   let data;
   try {
@@ -179,6 +168,51 @@ export function loadExport(inputPath) {
   if (Array.isArray(data)) return data;
   if (data && Array.isArray(data.conversations)) return data.conversations;
   throw new Error(`unexpected export shape in ${file}: expected an array of conversations`);
+}
+
+/**
+ * Locate the sharded conversation files in a directory, chronologically stable.
+ * Newer OpenAI exports split history into `conversations-000.json`,
+ * `conversations-001.json`, ... instead of a single `conversations.json`.
+ * @returns {string[]} absolute shard paths in numeric order, or [] if none.
+ */
+export function shardFiles(dir) {
+  return fs.readdirSync(dir)
+    .filter((f) => /^conversations-\d+\.json$/i.test(f))
+    .sort() // zero-padded indices sort lexicographically == numerically
+    .map((f) => path.join(dir, f));
+}
+
+/**
+ * Parse the export payload into an array of conversations. Accepts:
+ *   - a single conversations.json file,
+ *   - a directory containing conversations.json, OR
+ *   - a directory containing sharded conversations-NNN.json files (concatenated
+ *     in numeric order — the newer export format).
+ */
+export function loadExport(inputPath) {
+  let file = inputPath;
+  const stat = fs.existsSync(inputPath) ? fs.statSync(inputPath) : null;
+  if (!stat) throw new Error(`input not found: ${inputPath}`);
+  if (stat.isDirectory()) {
+    const single = path.join(inputPath, "conversations.json");
+    if (fs.existsSync(single)) {
+      file = single;
+    } else {
+      const shards = shardFiles(inputPath);
+      if (shards.length === 0) {
+        throw new Error(`no conversations.json or conversations-NNN.json in ${inputPath} (unzip the OpenAI export first, then point here)`);
+      }
+      // Sharded export: concatenate every shard in numeric order.
+      const all = [];
+      for (const s of shards) all.push(...parseConversationsFile(s));
+      return all;
+    }
+  }
+  if (/\.zip$/i.test(file)) {
+    throw new Error(`got a .zip — unzip it first (this tool is zero-dependency): expand it, then pass the conversations.json inside`);
+  }
+  return parseConversationsFile(file);
 }
 
 /**
