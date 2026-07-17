@@ -137,8 +137,13 @@ test("assembleContext surfaces a contradiction with the governing claim", () => 
       JSON.stringify(claim({ id: "clm-fix-0002", predicate: "status", value: "unknown", confidence: "unresolved" })),
     ].join("\n") + "\n");
   const md = assembleContext(dir, { today: TODAY }).markdown;
-  // unresolved guard outranks estimate.
-  assert.ok(md.includes("rely on `clm-fix-0002`"));
+  // Rendered faithfully as UNRESOLVED (Axiom 11), not downplayed to one claim.
+  assert.ok(md.includes("UNRESOLVED contradiction"));
+  assert.ok(md.includes("not evidence"));
+  // unresolved guard still outranks estimate as the safety-default (governing()).
+  assert.ok(md.includes("safety-default `clm-fix-0002`"));
+  // The losing side stays visible, not erased.
+  assert.ok(md.includes("clm-fix-0001"));
   assert.ok(md.includes("Open questions"));
 });
 

@@ -405,7 +405,13 @@ export function assembleContext(root = ROOT, opts = {}) {
         seen.add(c.predicate);
         const list = contradictions.get(c.predicate);
         const gov = governing(list);
-        lines.push(`- **${c.predicate}** ⚠ _(contradicted — ${list.length} active; rely on \`${gov.id}\`, ${gov.confidence})_: ${gov.value}`);
+        // Faithful rendering (Axiom 11): a live contradiction is presented AS
+        // unresolved, in proportion to its weight — never downplayed to a single
+        // claim to "rely on". The governing pick is a safety-first default by
+        // confidence-label precedence, NOT an evidence ruling (Axiom 10:
+        // confidence never earns belief on its own). Every side stays visible.
+        lines.push(`- **${c.predicate}** ⚠ _(UNRESOLVED contradiction — ${list.length} active claims; no evidence ruling)_`);
+        lines.push(`  - safety-default \`${gov.id}\` _(${gov.confidence}; by confidence-label precedence, not evidence — do not treat as settled)_: ${gov.value}`);
         for (const alt of list.sort(byId)) {
           if (alt.id === gov.id) continue;
           lines.push(`  - also active: ${alt.value} _(${alt.confidence}; ${alt.id})_`);
