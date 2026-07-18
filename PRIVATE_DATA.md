@@ -3,7 +3,7 @@ title: Private Data Policy
 type: governance
 classification: personal
 created: 2026-07-14
-updated: 2026-07-14
+updated: 2026-07-18
 ---
 
 # PRIVATE_DATA.md
@@ -47,6 +47,13 @@ external MCP calls unless the owner explicitly asks.
 
 The `private/` directory is excluded by `.gitignore` (except `.gitkeep`).
 **Verify `git status` never lists real files under `private/`.**
+
+Git-exclusion controls **publication**, not **at-rest confidentiality**:
+`private/` is plaintext on disk and still exposed to backups, cloud sync, other
+local accounts, malware, and disk theft. For the exposure vectors and the tiered
+at-rest mitigations (keep off synced paths, full-disk encryption, owner-only
+ACLs, encrypt the partition + backups), see `THREAT_MODEL.md` §Data-at-rest
+confidentiality (register item H9).
 
 ## Sensitive-but-trackable (only if repo stays private + opt-in)
 
