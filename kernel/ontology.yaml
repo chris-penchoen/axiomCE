@@ -5,7 +5,7 @@
 
 version: 0.1.0
 status: prototype
-updated: 2026-07-14
+updated: 2026-07-17
 
 # ---------------------------------------------------------------------------
 # Entity identity
@@ -71,6 +71,20 @@ lifecycle:
   retracted: "retracted_at is set"
   expired: "valid_to is in the past"
   contradiction: ">1 active claim sharing the same entity+predicate"
+  dormant: "A contradiction unresolved past policy.dormancy_days with NO new evidence (Axiom 12). Auto-parked off the active 'needs-you' surface into a still-visible `dormant` bucket. Parking is NOT resolution: both sides are preserved and it reactivates automatically the instant a newer claim touches the predicate. Age = days since the most recent asserted_at on the set."
+
+# ---------------------------------------------------------------------------
+# Policy (human-set knobs; single source of truth for governance thresholds)
+# ---------------------------------------------------------------------------
+policy:
+  # Axiom 12 dormancy threshold. A contradiction with no new evidence for this
+  # many days is auto-parked (still visible; reactivates on a newer claim). The
+  # ratified spec also names an "OR N sync cycles" trigger; that needs a
+  # persistent runtime cycle counter (not yet built), so the portable engine
+  # currently parks on elapsed time only — a strict subset that never parks
+  # earlier than the cycle rule would. Edit DEFAULT_DORMANCY_DAYS in
+  # tools/generate-views.mjs (or pass classify(..,{dormancyDays})) to change it.
+  dormancy_days: 90
 
 # ---------------------------------------------------------------------------
 # View generation
@@ -78,9 +92,14 @@ lifecycle:
 view:
   generated: true            # never hand-edit *.view.md; regenerate
   # When a predicate is contradicted (>1 active claim), the view names a
-  # GOVERNING claim by this precedence. Note: an explicit `unresolved` safety
-  # guard OUTRANKS an optimistic `estimate` — "unknown" must not be overridden
-  # by a guess. Ties broken by lowest claim id.
+  # GOVERNING claim. Axiom 10 — evidence outranks confidence: rank by evidence
+  # weight (count of DISTINCT sources asserting the same value) FIRST, then use
+  # `governing_precedence` only as the tiebreaker, then lowest claim id. The
+  # governing pick is an evidence-weighted DEFAULT surfaced for convenience — it
+  # is NOT a resolution; a live contradiction stays UNRESOLVED until a human
+  # ratifies (Axiom 18). Within the confidence tiebreak, an explicit
+  # `unresolved` safety guard OUTRANKS an optimistic `estimate` — "unknown" must
+  # not be overridden by a guess.
   governing_precedence: [confirmed, user-stated, inferred, unresolved, estimate]
 
 # ---------------------------------------------------------------------------
@@ -92,7 +111,7 @@ reconcile:
   # private/reconcile/manifest.jsonl.
   manifest_entry: [entity, predicate, canonical, token]
   token: "literal string expected to appear in `canonical` when it reflects the active claim"
-  findings: [MISSING_CLAIM, STALE_CANONICAL, UNRESOLVED_CONTRADICTION, STALE_VIEW]
+  findings: [MISSING_CLAIM, STALE_CANONICAL, UNRESOLVED_CONTRADICTION, DORMANT_CONTRADICTION, STALE_VIEW]
   never: "reconcile MUST NOT rewrite canonical prose; it only reports"
 
 # ---------------------------------------------------------------------------

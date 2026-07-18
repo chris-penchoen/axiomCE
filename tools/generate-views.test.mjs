@@ -13,6 +13,9 @@ import {
   classify,
   governing,
   evidenceWeight,
+  contradictionAgeDays,
+  isDormant,
+  DEFAULT_DORMANCY_DAYS,
   renderView,
   viewPath,
   generateAll,
@@ -101,11 +104,12 @@ test("a future valid_from claim is still active by lifecycle (not expired)", () 
 });
 
 test("two active claims on the same predicate are a contradiction", () => {
-  const a = claim({ id: "clm-fix-0001", value: "blue" });
-  const b = claim({ id: "clm-fix-0002", value: "green" });
-  const { contradictions } = classify([a, b], TODAY);
+  const a = claim({ id: "clm-fix-0001", value: "blue", asserted_at: TODAY + "T00:00:00Z" });
+  const b = claim({ id: "clm-fix-0002", value: "green", asserted_at: TODAY + "T00:00:00Z" });
+  const { contradictions, dormant } = classify([a, b], TODAY);
   assert.ok(contradictions.has("color"));
   assert.equal(contradictions.get("color").length, 2);
+  assert.equal(dormant.size, 0); // recent evidence → live, not parked
 });
 
 // --- governing precedence ---
@@ -170,6 +174,69 @@ test("duplicate sources do not inflate evidence weight", () => {
   assert.equal(governing([a, b, c]).value, "red");
 });
 
+// --- Axiom 12: dormancy (auto-park contradictions with no new evidence) ---
+const OLD = "2026-01-01T00:00:00Z";      // ~194d before TODAY
+const RECENT = "2026-07-10T00:00:00Z";   // 4d before TODAY
+
+test("contradictionAgeDays measures days since the most recent evidence", () => {
+  const a = claim({ id: "clm-fix-0001", value: "blue", asserted_at: OLD });
+  const b = claim({ id: "clm-fix-0002", value: "green", asserted_at: RECENT });
+  // Newest evidence is RECENT (2026-07-10) → 4 days before TODAY (2026-07-14).
+  assert.equal(contradictionAgeDays([a, b], TODAY), 4);
+});
+
+test("isDormant is true past the threshold, false under it", () => {
+  const list = [claim({ id: "a", value: "blue", asserted_at: OLD }), claim({ id: "b", value: "green", asserted_at: OLD })];
+  assert.equal(isDormant(list, TODAY, DEFAULT_DORMANCY_DAYS), true);
+  assert.equal(isDormant(list, TODAY, 365), false); // wider threshold → still live
+});
+
+test("classify parks an old, evidence-stale contradiction as dormant, not live", () => {
+  const a = claim({ id: "clm-fix-0001", value: "blue", asserted_at: OLD });
+  const b = claim({ id: "clm-fix-0002", value: "green", asserted_at: OLD });
+  const { contradictions, dormant } = classify([a, b], TODAY);
+  assert.equal(contradictions.has("color"), false); // off the active surface
+  assert.ok(dormant.has("color"));                   // parked, still present
+  assert.equal(dormant.get("color").length, 2);      // both sides preserved
+});
+
+test("a new observation auto-reactivates a dormant contradiction", () => {
+  const a = claim({ id: "clm-fix-0001", value: "blue", asserted_at: OLD });
+  const b = claim({ id: "clm-fix-0002", value: "green", asserted_at: OLD });
+  // A fresh claim on the same predicate resets the evidence clock.
+  const c = claim({ id: "clm-fix-0003", value: "green", source: "s2", asserted_at: RECENT });
+  const { contradictions, dormant } = classify([a, b, c], TODAY);
+  assert.ok(contradictions.has("color")); // live again — no explicit un-park needed
+  assert.equal(dormant.size, 0);
+});
+
+test("the dormancy threshold is a configurable (human-set) policy knob", () => {
+  const a = claim({ id: "a", value: "blue", asserted_at: RECENT });
+  const b = claim({ id: "b", value: "green", asserted_at: RECENT });
+  // 4 days old: dormant only if the threshold is set below that.
+  assert.equal(classify([a, b], TODAY, { dormancyDays: 3 }).dormant.has("color"), true);
+  assert.equal(classify([a, b], TODAY, { dormancyDays: 30 }).dormant.has("color"), false);
+});
+
+test("a single active claim is never dormant (dormancy needs a contradiction)", () => {
+  const { contradictions, dormant } = classify([claim({ asserted_at: OLD })], TODAY);
+  assert.equal(contradictions.size, 0);
+  assert.equal(dormant.size, 0);
+});
+
+test("renderView shows a dormant contradiction in its own bucket, not as live", () => {
+  const e = { id: "vehicle:x", title: "X", classification: "public", canonical: null, claims: null };
+  const a = claim({ id: "clm-fix-0001", value: "blue", asserted_at: OLD });
+  const b = claim({ id: "clm-fix-0002", value: "green", asserted_at: OLD });
+  const out = renderView(e, [a, b], TODAY);
+  assert.ok(out.includes("## Dormant contradictions"));
+  assert.ok(out.includes("💤"));
+  assert.ok(out.includes("not resolution") || out.includes("NOT resolution"));
+  // The live Contradictions section reports none.
+  const live = out.split("## Dormant")[0];
+  assert.ok(live.includes("_None. No predicate has more than one active claim._"));
+});
+
 // --- rendering ---
 test("renderView is deterministic for identical input", () => {
   const e = { id: "vehicle:x", title: "X", classification: "public", canonical: null, claims: null };
@@ -179,8 +246,8 @@ test("renderView is deterministic for identical input", () => {
 
 test("renderView marks a contradiction's governing claim", () => {
   const e = { id: "vehicle:x", title: "X", classification: "public", canonical: null, claims: null };
-  const guard = claim({ id: "clm-fix-0002", confidence: "unresolved", value: "unknown" });
-  const guess = claim({ id: "clm-fix-0001", confidence: "estimate", value: "guessed" });
+  const guard = claim({ id: "clm-fix-0002", confidence: "unresolved", value: "unknown", asserted_at: TODAY + "T00:00:00Z" });
+  const guess = claim({ id: "clm-fix-0001", confidence: "estimate", value: "guessed", asserted_at: TODAY + "T00:00:00Z" });
   const out = renderView(e, [guard, guess], TODAY);
   assert.ok(out.includes("governing: `clm-fix-0002`"));
   assert.ok(out.includes("← governs"));

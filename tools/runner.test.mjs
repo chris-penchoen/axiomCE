@@ -133,8 +133,8 @@ test("assembleContext surfaces a contradiction with the governing claim", () => 
   write(dir, "entities/fix.md", entityFile("organization:fix", "public"));
   write(dir, "claims/organization-fix.jsonl",
     [
-      JSON.stringify(claim({ id: "clm-fix-0001", predicate: "status", value: "guessed", confidence: "estimate" })),
-      JSON.stringify(claim({ id: "clm-fix-0002", predicate: "status", value: "unknown", confidence: "unresolved" })),
+      JSON.stringify(claim({ id: "clm-fix-0001", predicate: "status", value: "guessed", confidence: "estimate", asserted_at: TODAY + "T00:00:00Z" })),
+      JSON.stringify(claim({ id: "clm-fix-0002", predicate: "status", value: "unknown", confidence: "unresolved", asserted_at: TODAY + "T00:00:00Z" })),
     ].join("\n") + "\n");
   const md = assembleContext(dir, { today: TODAY }).markdown;
   // Rendered faithfully as UNRESOLVED (Axiom 11), not downplayed to one claim.

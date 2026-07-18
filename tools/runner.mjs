@@ -35,7 +35,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 import { parseFrontMatter } from "./validate.mjs";
-import { loadClaims, loadEntities, classify, governing, evidenceWeight, generateAll } from "./generate-views.mjs";
+import { loadClaims, loadEntities, classify, governing, evidenceWeight, contradictionAgeDays, generateAll } from "./generate-views.mjs";
 import { validateClaimShape } from "./validate-claims.mjs";
 import { scanContent, scanSensitiveData } from "./privacy-check.mjs";
 
@@ -384,7 +384,7 @@ export function assembleContext(root = ROOT, opts = {}) {
   }
   for (const e of entities) {
     const mine = allClaims.filter((c) => c.entity === e.id).sort(byId);
-    const { active, contradictions } = classify(mine, today);
+    const { active, contradictions, dormant } = classify(mine, today);
     manifest.entities.push(e.id);
     lines.push(`### ${e.title} \`${e.id}\``);
     lines.push("");
@@ -394,6 +394,7 @@ export function assembleContext(root = ROOT, opts = {}) {
       continue;
     }
     const contradicted = new Set([...contradictions.keys()]);
+    const parked = new Set([...dormant.keys()]);
     // One line per active predicate; for a contradicted predicate, name the
     // evidence-weighted governing default (Axiom 10) rather than silently picking.
     const seen = new Set();
@@ -415,6 +416,24 @@ export function assembleContext(root = ROOT, opts = {}) {
         // policy (Axiom 18); until then every side stays visible and open.
         lines.push(`- **${c.predicate}** ⚠ _(UNRESOLVED contradiction — ${list.length} active claims; not auto-resolved)_`);
         lines.push(`  - governing default \`${gov.id}\` _(${gov.confidence}; ${govW} src; evidence-weighted per Axiom 10, not a settled ruling)_: ${gov.value}`);
+        for (const alt of list.sort(byId)) {
+          if (alt.id === gov.id) continue;
+          const altW = evidenceWeight(alt, list);
+          lines.push(`  - also active: ${alt.value} _(${alt.confidence}; ${altW} src; ${alt.id})_`);
+        }
+      } else if (parked.has(c.predicate)) {
+        if (seen.has(c.predicate)) continue;
+        seen.add(c.predicate);
+        const list = dormant.get(c.predicate);
+        const gov = governing(list);
+        const govW = evidenceWeight(gov, list);
+        const age = contradictionAgeDays(list, today);
+        // Dormant contradiction (Axiom 12): parked off the active "needs-you"
+        // surface after sitting past the threshold with no new evidence, but
+        // kept visible (Axiom 11: no concealment). Parking is NOT resolution —
+        // both sides remain; a newer claim reactivates it automatically.
+        lines.push(`- **${c.predicate}** 💤 _(DORMANT contradiction — parked, ${list.length} active claims, ${age}d since last evidence; not resolved)_`);
+        lines.push(`  - evidence-weighted default \`${gov.id}\` _(${gov.confidence}; ${govW} src)_: ${gov.value}`);
         for (const alt of list.sort(byId)) {
           if (alt.id === gov.id) continue;
           const altW = evidenceWeight(alt, list);

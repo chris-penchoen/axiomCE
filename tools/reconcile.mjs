@@ -14,7 +14,9 @@
 // Findings (this tool NEVER rewrites canonical prose):
 //   MISSING_CLAIM           manifest field has no active claim
 //   STALE_CANONICAL         canonical prose does not contain the expected token
-//   UNRESOLVED_CONTRADICTION  >1 active claim for the field
+//   UNRESOLVED_CONTRADICTION  >1 active claim for the field (live — needs a human)
+//   DORMANT_CONTRADICTION   >1 active claim, but parked per Axiom 12 (info only,
+//                           non-blocking; reactivates on new evidence)
 //   STALE_VIEW              a generated *.view.md is out of date
 //
 // Usage:
@@ -75,7 +77,7 @@ export function reconcile(root, today) {
       continue;
     }
     const mine = claims.filter((c) => c.entity === m.entity);
-    const { active } = classify(mine, today);
+    const { active, dormant } = classify(mine, today);
     const act = active.filter((c) => c.predicate === m.predicate);
     if (act.length === 0) {
       findings.push({ type: "MISSING_CLAIM", entity: m.entity, predicate: m.predicate,
@@ -83,7 +85,12 @@ export function reconcile(root, today) {
       continue;
     }
     if (act.length > 1) {
-      findings.push({ type: "UNRESOLVED_CONTRADICTION", entity: m.entity, predicate: m.predicate,
+      // Axiom 12: a dormant (parked) contradiction is reported as informational,
+      // NOT as an open UNRESOLVED_CONTRADICTION to be acted on — it sat past the
+      // dormancy threshold with no new evidence and is intentionally parked
+      // (still preserved; reactivates on a newer claim).
+      const type = dormant.has(m.predicate) ? "DORMANT_CONTRADICTION" : "UNRESOLVED_CONTRADICTION";
+      findings.push({ type, entity: m.entity, predicate: m.predicate,
         detail: `${act.length} active claims for ${m.entity} ${m.predicate}` });
       continue;
     }
@@ -107,11 +114,15 @@ const isMain = process.argv[1] && path.resolve(process.argv[1]) === import.meta.
 if (isMain) {
   const root = path.resolve(process.argv[2] || ".");
   const findings = reconcile(root);
+  const INFO_ONLY = new Set(["DORMANT_CONTRADICTION"]);
   for (const f of findings) console.error(`${f.type.padEnd(24)} ${f.detail}`);
-  if (findings.length) {
-    console.error(`\nreconcile: ${findings.length} finding(s). Canonical prose left untouched — resolve manually.`);
+  const blocking = findings.filter((f) => !INFO_ONLY.has(f.type));
+  if (blocking.length) {
+    console.error(`\nreconcile: ${blocking.length} finding(s). Canonical prose left untouched — resolve manually.`);
     process.exit(1);
   }
-  console.log("reconcile: OK — canonical prose, claims, and views are in sync.");
+  const info = findings.length - blocking.length;
+  console.log(`reconcile: OK — canonical prose, claims, and views are in sync.` +
+    (info ? ` (${info} informational: dormant/parked — no action needed.)` : ""));
   process.exit(0);
 }

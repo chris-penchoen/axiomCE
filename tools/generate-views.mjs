@@ -22,6 +22,18 @@ import { parseFrontMatter } from "./validate.mjs";
 const ROOT = path.resolve(".");
 const TODAY = new Date().toISOString().slice(0, 10);
 
+// Axiom 12 — dormancy. A contradiction that has stayed visibly unresolved with
+// NO new evidence for this many days is auto-PARKED (moved off the active
+// "needs-you" surface into a still-visible `dormant` bucket). Parking is NOT
+// resolution: both sides are preserved and it reactivates automatically the
+// moment a newer claim touches the predicate. This is the single human-set
+// policy knob (ratification_log: ax12-dormancy). The ratified spec also names
+// an "OR N sync cycles" trigger; that requires a persistent runtime cycle
+// counter which does not exist yet, so the portable engine parks on elapsed
+// time only — a strict subset that never parks *earlier* than the cycle rule
+// would. The cycle trigger is a deferred runtime complement.
+export const DEFAULT_DORMANCY_DAYS = 90;
+
 const ENTITY_DIRS = ["entities", path.join("private", "entities")];
 const CLAIM_DIRS = ["claims", path.join("private", "claims")];
 const PRIVATE_CLASSES = new Set(["restricted", "sensitive"]);
@@ -74,10 +86,37 @@ export function loadEntities(root = ROOT) {
 }
 
 /**
- * Classify each claim's lifecycle state relative to `today`.
- * @returns {{ active: object[], history: object[], contradictions: Map<string, object[]> }}
+ * Days since the most recent evidence (asserted_at, falling back to valid_from)
+ * touched any claim in a contradicted set. This is "how long the contradiction
+ * has sat with no new evidence" — a newer claim on the predicate lowers this to
+ * ~0, which is exactly how Axiom 12 auto-reactivation is expressed: no separate
+ * un-park step is needed.
  */
-export function classify(claims, today = TODAY) {
+export function contradictionAgeDays(list, today = TODAY) {
+  const latest = list
+    .map((c) => String(c.asserted_at || c.valid_from || "").slice(0, 10))
+    .filter(Boolean)
+    .sort()
+    .pop();
+  if (!latest) return 0;
+  const ms = Date.parse(today + "T00:00:00Z") - Date.parse(latest + "T00:00:00Z");
+  return Number.isFinite(ms) ? Math.floor(ms / 86400000) : 0;
+}
+
+/** Axiom 12: a contradiction is dormant once it exceeds the (human-set) day threshold with no new evidence. */
+export function isDormant(list, today = TODAY, dormancyDays = DEFAULT_DORMANCY_DAYS) {
+  return contradictionAgeDays(list, today) >= dormancyDays;
+}
+
+/**
+ * Classify each claim's lifecycle state relative to `today`.
+ * Contradictions (>1 active claim per predicate) are split into `contradictions`
+ * (LIVE — on the active surface, needs a human) and `dormant` (parked past the
+ * dormancy threshold per Axiom 12 — still visible, never resolved/deleted).
+ * @returns {{ active: object[], history: object[], contradictions: Map<string, object[]>, dormant: Map<string, object[]> }}
+ */
+export function classify(claims, today = TODAY, opts = {}) {
+  const dormancyDays = opts.dormancyDays ?? DEFAULT_DORMANCY_DAYS;
   const supersededIds = new Set(claims.filter((c) => c.supersedes).map((c) => c.supersedes));
   const isExpired = (c) => c.valid_to && c.valid_to < today;
   const isActive = (c) =>
@@ -92,10 +131,14 @@ export function classify(claims, today = TODAY) {
     byPredicate.get(c.predicate).push(c);
   }
   const contradictions = new Map();
+  const dormant = new Map();
   for (const [pred, list] of byPredicate) {
-    if (list.length > 1) contradictions.set(pred, list);
+    if (list.length > 1) {
+      if (isDormant(list, today, dormancyDays)) dormant.set(pred, list);
+      else contradictions.set(pred, list);
+    }
   }
-  return { active, history, contradictions, supersededIds, isExpired };
+  return { active, history, contradictions, dormant, supersededIds, isExpired };
 }
 
 const byId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -156,8 +199,9 @@ export function governing(list) {
 /** Render the Markdown view body for one entity. */
 export function renderView(entity, claims, today = TODAY) {
   const mine = claims.filter((c) => c.entity === entity.id).sort(byId);
-  const { active, history, contradictions, supersededIds, isExpired } = classify(mine, today);
+  const { active, history, contradictions, dormant, supersededIds, isExpired } = classify(mine, today);
   const contradicted = new Set([...contradictions.keys()]);
+  const parked = new Set([...dormant.keys()]);
 
   const lines = [];
   lines.push("---");
@@ -178,7 +222,7 @@ export function renderView(entity, claims, today = TODAY) {
   if (entity.canonical) lines.push(`- **Canonical record:** \`${entity.canonical}\``);
   if (entity.claims) lines.push(`- **Claim log:** \`${entity.claims}\``);
   lines.push(`- **Generated:** ${today} · **Active facts:** ${active.length} · ` +
-    `**Contradictions:** ${contradictions.size} · **History entries:** ${history.length}`);
+    `**Contradictions:** ${contradictions.size} · **Dormant:** ${dormant.size} · **History entries:** ${history.length}`);
   lines.push("");
 
   // Contradictions first — highest signal.
@@ -204,6 +248,33 @@ export function renderView(entity, claims, today = TODAY) {
   }
   lines.push("");
 
+  // Dormant contradictions — parked per Axiom 12: unresolved but sat past the
+  // dormancy threshold with no new evidence. Kept visible (Axiom 11: no
+  // concealment); reactivates automatically when a newer claim arrives.
+  lines.push("## Dormant contradictions (parked — unresolved, no new evidence)");
+  lines.push("");
+  if (dormant.size === 0) {
+    lines.push("_None._");
+  } else {
+    lines.push("> These stayed unresolved past the dormancy threshold with no new");
+    lines.push("> evidence, so they were auto-parked off the active surface. This is");
+    lines.push("> NOT resolution — both sides are preserved. A new claim on the");
+    lines.push("> predicate reactivates it automatically.");
+    lines.push("");
+    for (const [pred, list] of [...dormant].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+      const gov = governing(list);
+      const govW = evidenceWeight(gov, list);
+      const age = contradictionAgeDays(list, today);
+      lines.push(`- **\`${pred}\`** 💤 — ${list.length} active, ${age}d since last evidence ` +
+        `(evidence-weighted default: \`${gov.id}\`, ${gov.confidence}, ${govW} source${govW === 1 ? "" : "s"}):`);
+      for (const c of list.sort(byId)) {
+        const w = evidenceWeight(c, list);
+        lines.push(`  - \`${c.id}\` (${c.confidence}; ${w} src): ${c.value}` + (c.note ? ` — ${c.note}` : ""));
+      }
+    }
+  }
+  lines.push("");
+
   // Active facts by predicate.
   lines.push("## Active facts");
   lines.push("");
@@ -212,7 +283,7 @@ export function renderView(entity, claims, today = TODAY) {
   } else {
     for (const c of active.slice().sort((a, b) =>
       a.predicate < b.predicate ? -1 : a.predicate > b.predicate ? 1 : byId(a, b))) {
-      const flag = contradicted.has(c.predicate) ? " ⚠" : "";
+      const flag = contradicted.has(c.predicate) ? " ⚠" : parked.has(c.predicate) ? " 💤" : "";
       const vt = c.valid_to ? `, valid to ${c.valid_to}` : "";
       lines.push(`- **\`${c.predicate}\`**${flag}: ${c.value}  ` +
         `\n  _(${c.confidence}; ${c.id}; from ${c.valid_from}${vt}; source: ${c.source})_` +

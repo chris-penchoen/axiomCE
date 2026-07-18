@@ -106,13 +106,28 @@ test("UNRESOLVED_CONTRADICTION when two active claims share the field", () => {
   const dir = tmpDir();
   write(dir, "entities/x.md", entityFile("vehicle:x", "public"));
   write(dir, "claims/x.jsonl",
+    JSON.stringify(claim({ id: "clm-fix-0001", value: "blue", asserted_at: TODAY + "T00:00:00Z" })) + "\n" +
+    JSON.stringify(claim({ id: "clm-fix-0002", value: "green", asserted_at: TODAY + "T00:00:00Z" })) + "\n");
+  write(dir, "vehicles/x.md", "The car is blue.");
+  write(dir, "reconcile/manifest.jsonl", MANIFEST);
+  generateAll(dir);
+  const findings = reconcile(dir, TODAY);
+  assert.ok(findings.some((f) => f.type === "UNRESOLVED_CONTRADICTION"));
+});
+
+test("DORMANT_CONTRADICTION (not UNRESOLVED) when the contradiction is evidence-stale", () => {
+  const dir = tmpDir();
+  write(dir, "entities/x.md", entityFile("vehicle:x", "public"));
+  // Both claims old (asserted 2026-01-01, ~194d before TODAY) → parked per Axiom 12.
+  write(dir, "claims/x.jsonl",
     JSON.stringify(claim({ id: "clm-fix-0001", value: "blue" })) + "\n" +
     JSON.stringify(claim({ id: "clm-fix-0002", value: "green" })) + "\n");
   write(dir, "vehicles/x.md", "The car is blue.");
   write(dir, "reconcile/manifest.jsonl", MANIFEST);
   generateAll(dir);
   const findings = reconcile(dir, TODAY);
-  assert.ok(findings.some((f) => f.type === "UNRESOLVED_CONTRADICTION"));
+  assert.ok(findings.some((f) => f.type === "DORMANT_CONTRADICTION"));
+  assert.ok(!findings.some((f) => f.type === "UNRESOLVED_CONTRADICTION"));
 });
 
 test("STALE_VIEW when a generated view is out of date", () => {
