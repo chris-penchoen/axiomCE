@@ -20,6 +20,9 @@ import {
   loadQueue,
   planSync,
   applySync,
+  applyDeadLetter,
+  loadDeadLetter,
+  deadLetterKey,
   planRatify,
   applyRatify,
   triageBucket,
@@ -731,4 +734,66 @@ test("a retracted claim drops out of the active set (classify honors retracted_a
   applyRetract(dir, planRetract(dir, { ids: ["clm-fix-0001"], today: TODAY }), { now: "2026-07-14T12:00:00Z", reason: "wrong" });
   const after = assembleContext(dir, { today: TODAY }).markdown;
   assert.ok(!after.includes("blue"));
+});
+
+// --- dead-letter (rt-dead-letter) ---
+test("planSync: a poison record no longer blocks clean candidates; both are separated", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [
+    obsClaim({ predicate: "good", value: "v1" }),        // clean
+    "{ this is not json",                                   // malformed -> dead-letter
+    obsClaim({ predicate: "bad", value: "v2", entity: "organization:ghost" }), // missing entity -> dead-letter
+  ]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(plan.queued.length, 1);                    // the clean one still queues
+  assert.equal(plan.deadLetters.length, 2);               // two poison lines set aside
+  assert.ok(plan.problems.length >= 2);
+});
+
+test("applyDeadLetter writes PRIVATE-only records and is idempotent by dl_key", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", ["{ not json"]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  const r1 = applyDeadLetter(dir, plan.deadLetters, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(r1.quarantined, 1);
+  // routed to private/, never tracked
+  assert.ok(fs.existsSync(path.join(dir, "private", "runtime", "dead-letter.jsonl")));
+  assert.ok(!fs.existsSync(path.join(dir, "runtime", "dead-letter.jsonl")));
+  // re-applying the same dead-letters is a no-op (idempotent)
+  const r2 = applyDeadLetter(dir, plan.deadLetters, { now: "2026-07-15T00:00:01Z" });
+  assert.equal(r2.quarantined, 0);
+});
+
+test("a quarantined line is skipped on subsequent syncs (no re-flood, unattended progress)", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", ["{ not json", JSON.stringify(obsClaim({ predicate: "good", value: "v1" }))]);
+  const plan1 = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(plan1.deadLetters.length, 1);
+  applyDeadLetter(dir, plan1.deadLetters, { now: "2026-07-15T00:00:00Z" });
+  applySync(dir, plan1, { now: "2026-07-15T00:00:00Z" });
+  // second run: the poison line is now recognized and skipped, not re-failed
+  const plan2 = planSync(dir, { now: "2026-07-15T00:00:02Z" });
+  assert.equal(plan2.deadLetters.length, 0);
+  assert.equal(plan2.problems.length, 0);
+  assert.equal(plan2.quarantinedSkipped, 1);
+});
+
+test("deadLetterKey is stable for identical text and differs when the line is edited", () => {
+  assert.equal(deadLetterKey("{ bad"), deadLetterKey("{ bad"));
+  assert.notEqual(deadLetterKey("{ bad"), deadLetterKey("{ bad fixed"));
+  assert.match(deadLetterKey("x"), /^dl-[0-9a-f]{32}$/);
+});
+
+test("loadDeadLetter reflects written quarantine keys", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", ["{ nope"]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  applyDeadLetter(dir, plan.deadLetters, { now: "2026-07-15T00:00:00Z" });
+  const keys = loadDeadLetter(dir);
+  assert.equal(keys.size, 1);
+  assert.ok(keys.has(plan.deadLetters[0].dl_key));
 });

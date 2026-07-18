@@ -124,6 +124,20 @@ triage:
   hard_excluded_from_automation: [privacy-hold, needs-clarification]
 
 # ---------------------------------------------------------------------------
+# Dead-letter quarantine (rt-dead-letter)
+# ---------------------------------------------------------------------------
+dead_letter:
+  # `sync --apply` runs unattended, so a single poison observation must NOT
+  # abort the whole run. Candidates that fail the gates (malformed JSON, missing
+  # entity, schema/privacy violations) are set aside per-record; the clean
+  # candidates still enqueue. Inspect with `runner.mjs dead-letter`.
+  store: "private/runtime/dead-letter.jsonl (PRIVATE-only, fail-closed)"
+  why_private: "a rejected candidate's classification is untrusted and its raw text may hold sensitive data, so quarantine never lands in a tracked file"
+  key: "dl_key = hash of the exact trimmed source line — stable across file/line shifts; a later sync skips an already-quarantined line, so it never re-floods problems or blocks progress"
+  reprocess: "edit the offending source line (changes dl_key) and re-sync; the corrected line is processed normally, the old quarantine record is inert"
+  record: "{ dl_key, source_file, line, problems[], raw, quarantined_at }"
+
+# ---------------------------------------------------------------------------
 # View generation
 # ---------------------------------------------------------------------------
 view:

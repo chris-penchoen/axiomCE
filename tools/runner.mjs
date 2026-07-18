@@ -75,6 +75,12 @@ function runtimePaths(root = ROOT, isPrivate = false) {
     // Append-only audit of delegated (policy-driven) ratification decisions
     // (Axiom 18 guardrail #2). Routed public/private like everything else.
     audit: path.join(base, "delegated-audit.jsonl"),
+    // Quarantine for candidates that failed the gates (rt-dead-letter). A poison
+    // record no longer aborts the whole sync run — it is set aside here so the
+    // clean candidates still make progress. Written PRIVATE-only (see
+    // applyDeadLetter): a rejected candidate's classification is untrusted and
+    // its raw content may hold sensitive data, so quarantine is fail-closed.
+    deadLetter: path.join(base, "dead-letter.jsonl"),
   };
 }
 
@@ -230,6 +236,28 @@ export function loadQueue(root = ROOT) {
     ...readJsonl(runtimePaths(root, false).queue),
     ...readJsonl(runtimePaths(root, true).queue),
   ];
+}
+
+/**
+ * Stable quarantine key for a raw observation line — a hash of the exact trimmed
+ * text. Independent of file/line (which shift), so a dead-lettered poison line
+ * is recognized and skipped on every later sync until the source is edited (an
+ * edit changes the text -> new key -> reprocessed normally). Distinct from
+ * candidateHash, which needs parseable semantic fields a malformed line lacks.
+ */
+export function deadLetterKey(rawTrimmed) {
+  return "dl-" + crypto.createHash("sha256").update(rawTrimmed).digest("hex").slice(0, 32);
+}
+
+/** Set of quarantine keys already recorded (public + private dead-letter logs). */
+export function loadDeadLetter(root = ROOT) {
+  const keys = new Set();
+  for (const isPrivate of [false, true]) {
+    for (const rec of readJsonl(runtimePaths(root, isPrivate).deadLetter)) {
+      if (rec && rec.dl_key) keys.add(rec.dl_key);
+    }
+  }
+  return keys;
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +748,11 @@ export function planSync(root = ROOT, opts = {}) {
 
   const entityIds = new Set(loadEntities(root).map((e) => e.id));
   const ledger = loadLedger(root);
+  const deadLettered = loadDeadLetter(root);
+  // Group per-line failures so each poison line becomes ONE quarantine record
+  // (a candidate can raise several problem messages). Keyed by dl_key.
+  const dlMap = new Map();
+  let quarantinedSkipped = 0;
   // Seed minting from canon + already-queued claims so new ids stay sequential
   // and never collide with pending (not-yet-ratified) claims.
   const known = [...loadClaims(root), ...loadQueue(root).map((q) => ({ id: q.claim.id }))];
@@ -732,14 +765,24 @@ export function planSync(root = ROOT, opts = {}) {
       const t = raw.trim();
       if (!t || t.startsWith("//")) return;
       const lineNo = i + 1;
+      const dlKey = deadLetterKey(t);
+      // Already quarantined on a prior run: skip so it never blocks progress or
+      // re-floods problems. It stays set-aside until the source line is edited.
+      if (deadLettered.has(dlKey)) { quarantinedSkipped++; return; }
+
+      const fail = (msg) => {
+        problems.push({ file: f, line: lineNo, msg });
+        if (!dlMap.has(dlKey)) dlMap.set(dlKey, { dl_key: dlKey, source_file: f, line: lineNo, raw: t, problems: [] });
+        dlMap.get(dlKey).problems.push(msg);
+      };
 
       let obj;
       try { obj = JSON.parse(t); } catch (e) {
-        problems.push({ file: f, line: lineNo, msg: `malformed JSON: ${e.message}` });
+        fail(`malformed JSON: ${e.message}`);
         return;
       }
       if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
-        problems.push({ file: f, line: lineNo, msg: "candidate is not a JSON object" });
+        fail("candidate is not a JSON object");
         return;
       }
 
@@ -752,7 +795,7 @@ export function planSync(root = ROOT, opts = {}) {
       seenThisRun.add(obsId);
 
       const res = evaluateCandidate(obj, { root, entityIds, known, mintedIds, now });
-      for (const m of res.problems) problems.push({ file: f, line: lineNo, msg: m });
+      for (const m of res.problems) fail(m);
       // Only fully-clean candidates are queued (sync may run unattended).
       if (res.shapeOk && res.problems.length === 0) {
         queued.push({
@@ -768,7 +811,7 @@ export function planSync(root = ROOT, opts = {}) {
     });
   }
 
-  return { queued, duplicates, problems, files };
+  return { queued, duplicates, problems, files, deadLetters: [...dlMap.values()], quarantinedSkipped };
 }
 
 /**
@@ -863,6 +906,37 @@ export function applySync(root = ROOT, plan, opts = {}) {
   }
 
   return { queuedCount: fresh.length, runManifestPath: path.relative(root, runPath) };
+}
+
+/**
+ * Quarantine failed candidates (rt-dead-letter). Appends one record per poison
+ * line to the PRIVATE dead-letter log (fail-closed: a rejected candidate's
+ * classification is untrusted and its raw text may hold sensitive data, so it
+ * must never land in a tracked file). Recording the dl_key lets later syncs skip
+ * the same bad line instead of re-failing on it forever. Idempotent: keys
+ * already present are not appended again.
+ * @param {string} root
+ * @param {object[]} deadLetters  plan.deadLetters
+ * @param {{ now?:string }} opts
+ * @returns {{ quarantined:number }}
+ */
+export function applyDeadLetter(root = ROOT, deadLetters, opts = {}) {
+  if (!deadLetters || !deadLetters.length) return { quarantined: 0 };
+  const now = opts.now || new Date().toISOString();
+  const existing = loadDeadLetter(root);
+  const fresh = deadLetters.filter((d) => !existing.has(d.dl_key));
+  if (!fresh.length) return { quarantined: 0 };
+  const records = fresh.map((d) => ({
+    dl_key: d.dl_key,
+    source_file: d.source_file,
+    line: d.line,
+    problems: d.problems,
+    raw: d.raw,
+    quarantined_at: now,
+  }));
+  // Always private/ — quarantine is fail-closed.
+  appendJsonl(runtimePaths(root, true).deadLetter, records);
+  return { quarantined: records.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,24 +1436,30 @@ function runSync(opts) {
     for (const q of plan.queued) for (const w of q.warns) console.error(`WARN ${q.source_file}:${q.line}: ${w}`);
 
     if (!opts.apply) {
-      console.log(`sync (dry-run): ${plan.queued.length} new claim(s) would be queued, ${plan.duplicates.length} duplicate(s) skipped, ${plan.problems.length} problem(s).`);
+      console.log(`sync (dry-run): ${plan.queued.length} new claim(s) would be queued, ${plan.duplicates.length} duplicate(s) skipped, ${plan.deadLetters.length} would be quarantined (${plan.problems.length} problem msg(s)), ${plan.quarantinedSkipped} already quarantined.`);
       for (const q of plan.queued) console.log(`  + ${q.claim.id} <- ${q.source_file}:${q.line}  (${q.claim.confidence}, ${q.claim.classification})${q.private ? " [private]" : ""} -> queue`);
+      for (const d of plan.deadLetters) console.log(`  ! ${d.source_file}:${d.line} -> dead-letter (${d.problems.length} problem(s))`);
       if (plan.queued.length) console.log(`\nRe-run with --apply to enqueue, then: node tools/runner.mjs ratify --all`);
       return plan;
     }
-    if (plan.problems.length) {
-      console.error(`\nsync: ${plan.problems.length} problem(s); nothing enqueued (fix or remove the offending observation).`);
-      return plan;
-    }
-    const { queuedCount, runManifestPath } = withWriterLock(ROOT, () => applySync(ROOT, plan, {}));
-    console.log(`sync: ${queuedCount} claim(s) enqueued for ratification; ${plan.duplicates.length} duplicate(s) skipped. Manifest: ${runManifestPath}`);
+    // Per-record quarantine (rt-dead-letter): failed candidates are set aside so
+    // the clean ones still make progress — a poison record never aborts the run.
+    const { queuedCount, runManifestPath } = withWriterLock(ROOT, () => {
+      const dl = applyDeadLetter(ROOT, plan.deadLetters, {});
+      const s = applySync(ROOT, plan, {});
+      return { ...s, quarantined: dl.quarantined };
+    });
+    const dlCount = plan.deadLetters.length;
+    console.log(`sync: ${queuedCount} claim(s) enqueued for ratification; ${plan.duplicates.length} duplicate(s) skipped; ${dlCount} quarantined to dead-letter; ${plan.quarantinedSkipped} already quarantined. Manifest: ${runManifestPath}`);
     if (queuedCount) console.log(`Review: node tools/runner.mjs ratify --all   (or --id <clm-...>)`);
+    if (dlCount) console.log(`Quarantined (fix the source line, then re-sync): node tools/runner.mjs dead-letter`);
     return plan;
   };
 
   if (!opts.watch) {
     const plan = runOnce();
-    process.exit(opts.apply && plan.problems.length ? 1 : 0);
+    // Quarantined records are NOT a run failure — that's the whole point. Exit 0.
+    process.exit(0);
   }
 
   // --watch: debounced re-run on observation-drop changes. Zero-dep fs.watch.
@@ -1457,6 +1537,23 @@ function runRetract(opts) {
 // classification + target ONLY — never the claim VALUE (mirrors ratify dry-run).
 function queueLabel(q) {
   return `${q.claim.id} (${q.claim.confidence}, ${q.claim.classification}) -> ${q.target}`;
+}
+
+function runDeadLetter(opts) {
+  // Dead-letter records live PRIVATE-only. Print source/line + problem TYPE
+  // messages (safe) but NEVER the raw candidate text (may hold the secret).
+  const records = readJsonl(runtimePaths(ROOT, true).deadLetter)
+    .concat(readJsonl(runtimePaths(ROOT, false).deadLetter));
+  if (records.length === 0) {
+    console.log("dead-letter: quarantine is empty — no failed candidates set aside.");
+    process.exit(0);
+  }
+  console.log(`dead-letter: ${records.length} quarantined candidate(s). Fix the source line and re-sync to reprocess (raw text withheld — it may contain sensitive data).\n`);
+  for (const r of records) {
+    console.log(`  ${r.source_file}:${r.line}  [${r.dl_key}]  quarantined ${r.quarantined_at}`);
+    for (const p of r.problems || []) console.log(`      - ${p}`);
+  }
+  process.exit(0);
 }
 
 function runTriage(opts) {
@@ -1544,6 +1641,7 @@ if (isMain) {
   else if (cmd === "ratify") runRatify(opts);
   else if (cmd === "retract") runRetract(opts);
   else if (cmd === "triage") runTriage(opts);
+  else if (cmd === "dead-letter") runDeadLetter(opts);
   else if (cmd === "auto-ratify") runAutoRatify(opts);
   else {
     console.error([
@@ -1554,6 +1652,7 @@ if (isMain) {
       "  runner.mjs ratify (--all | --id <id>...) [--discard] [--apply]   # promote queued claims into canon",
       "  runner.mjs retract --id <claim_id>... --reason \"<why>\" [--apply]   # tombstone an active canonical claim (Axiom 24; audited, kept in history)",
       "  runner.mjs triage                                   # sort the pending queue into buckets (where you're needed)",
+      "  runner.mjs dead-letter                              # list quarantined candidates that failed the sync gates (rt-dead-letter)",
       "  runner.mjs auto-ratify [--auto-ready] [--ceiling <class>] [--ratio <n>] [--apply]  # delegated ratification (Axiom 18; default: fully manual)",
     ].join("\n"));
     process.exit(1);
