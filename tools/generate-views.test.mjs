@@ -11,6 +11,7 @@ import path from "node:path";
 
 import {
   classify,
+  distinctValues,
   governing,
   evidenceWeight,
   contradictionAgeDays,
@@ -110,6 +111,56 @@ test("two active claims on the same predicate are a contradiction", () => {
   assert.ok(contradictions.has("color"));
   assert.equal(contradictions.get("color").length, 2);
   assert.equal(dormant.size, 0); // recent evidence → live, not parked
+});
+
+// --- corroboration vs contradiction (rt-corroboration-vs-contradiction) ---
+test("two active claims with the SAME value are corroboration, not contradiction", () => {
+  const a = claim({ id: "clm-fix-0001", value: "blue", source: "src-a" });
+  const b = claim({ id: "clm-fix-0002", value: "blue", source: "src-b" });
+  const { contradictions, dormant, corroborated } = classify([a, b], TODAY);
+  assert.equal(contradictions.size, 0);
+  assert.equal(dormant.size, 0);
+  assert.ok(corroborated.has("color"));
+  assert.equal(corroborated.get("color").length, 2);
+});
+
+test("corroboration is case- and whitespace-tolerant only by whitespace (case-sensitive)", () => {
+  const same = classify([
+    claim({ id: "clm-fix-0001", value: "dark  blue", source: "a" }),
+    claim({ id: "clm-fix-0002", value: "dark blue", source: "b" }),
+  ], TODAY);
+  assert.ok(same.corroborated.has("color"), "collapsed whitespace agrees");
+
+  const diff = classify([
+    claim({ id: "clm-fix-0001", value: "Blue", source: "a", asserted_at: TODAY + "T00:00:00Z" }),
+    claim({ id: "clm-fix-0002", value: "blue", source: "b", asserted_at: TODAY + "T00:00:00Z" }),
+  ], TODAY);
+  assert.ok(diff.contradictions.has("color"), "different case is NOT merged");
+});
+
+test("a genuine disagreement among otherwise-agreeing claims is still a contradiction", () => {
+  const { contradictions, corroborated } = classify([
+    claim({ id: "clm-fix-0001", value: "blue", source: "a", asserted_at: TODAY + "T00:00:00Z" }),
+    claim({ id: "clm-fix-0002", value: "blue", source: "b", asserted_at: TODAY + "T00:00:00Z" }),
+    claim({ id: "clm-fix-0003", value: "green", source: "c", asserted_at: TODAY + "T00:00:00Z" }),
+  ], TODAY);
+  assert.ok(contradictions.has("color"));
+  assert.equal(corroborated.size, 0);
+});
+
+test("distinctValues counts normalized distinct values", () => {
+  assert.equal(distinctValues([claim({ value: "blue" }), claim({ value: "blue " })]), 1);
+  assert.equal(distinctValues([claim({ value: "blue" }), claim({ value: "green" })]), 2);
+});
+
+test("corroborated claims never go dormant even when old", () => {
+  const OLD = "2026-01-01T00:00:00Z";
+  const { corroborated, dormant } = classify([
+    claim({ id: "clm-fix-0001", value: "blue", source: "a", asserted_at: OLD }),
+    claim({ id: "clm-fix-0002", value: "blue", source: "b", asserted_at: OLD }),
+  ], TODAY, { dormancyDays: 3 });
+  assert.ok(corroborated.has("color"));
+  assert.equal(dormant.size, 0);
 });
 
 // --- governing precedence ---

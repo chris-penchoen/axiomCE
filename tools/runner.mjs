@@ -519,7 +519,7 @@ export function assembleContext(root = ROOT, opts = {}) {
   }
   for (const e of entities) {
     const mine = allClaims.filter((c) => c.entity === e.id).sort(byId);
-    const { active, contradictions, dormant } = classify(mine, today);
+    const { active, contradictions, dormant, corroborated } = classify(mine, today);
     manifest.entities.push(e.id);
     lines.push(`### ${e.title} \`${e.id}\``);
     lines.push("");
@@ -530,6 +530,7 @@ export function assembleContext(root = ROOT, opts = {}) {
     }
     const contradicted = new Set([...contradictions.keys()]);
     const parked = new Set([...dormant.keys()]);
+    const agreed = new Set([...corroborated.keys()]);
     // One line per active predicate; for a contradicted predicate, name the
     // evidence-weighted governing default (Axiom 10) rather than silently picking.
     const seen = new Set();
@@ -574,6 +575,15 @@ export function assembleContext(root = ROOT, opts = {}) {
           const altW = evidenceWeight(alt, list);
           lines.push(`  - also active: ${alt.value} _(${alt.confidence}; ${altW} src; ${alt.id})_`);
         }
+      } else if (agreed.has(c.predicate)) {
+        if (seen.has(c.predicate)) continue;
+        seen.add(c.predicate);
+        const list = corroborated.get(c.predicate);
+        const gov = governing(list);
+        const w = evidenceWeight(gov, list);
+        // Corroboration (Axiom 9): >1 active claim, all the same value from
+        // independent sources. Agreement, not conflict — shown once, positively.
+        lines.push(`- **${c.predicate}** ✓ _(corroborated by ${w} source${w === 1 ? "" : "s"})_: ${gov.value}`);
       } else {
         lines.push(`- **${c.predicate}** _(${c.confidence})_: ${c.value}`);
       }

@@ -110,12 +110,27 @@ export function isDormant(list, today = TODAY, dormancyDays = DEFAULT_DORMANCY_D
   return contradictionAgeDays(list, today) >= dormancyDays;
 }
 
+/** Whitespace-normalized, case-sensitive value key. Different phrasings are
+ * deliberately NOT merged (conservative: never over-corroborate or falsely
+ * reconcile a disagreement). Shared by distinctValues + evidenceWeight so the
+ * corroboration and evidence-weight views agree on what "the same value" means. */
+const normValue = (v) => String(v ?? "").trim().replace(/\s+/g, " ");
+
+/** Count of DISTINCT normalized values asserted across a set sharing a predicate.
+ * 1 => every active claim agrees (corroboration); >1 => genuine disagreement. */
+export function distinctValues(list) {
+  return new Set(list.map((c) => normValue(c.value))).size;
+}
+
 /**
  * Classify each claim's lifecycle state relative to `today`.
- * Contradictions (>1 active claim per predicate) are split into `contradictions`
- * (LIVE — on the active surface, needs a human) and `dormant` (parked past the
- * dormancy threshold per Axiom 12 — still visible, never resolved/deleted).
- * @returns {{ active: object[], history: object[], contradictions: Map<string, object[]>, dormant: Map<string, object[]> }}
+ * A predicate with >1 active claim is a genuine CONTRADICTION only when the
+ * claims assert more than one distinct value. When several independent sources
+ * assert the SAME value it is CORROBORATION (Axiom 9), not conflict — it is
+ * surfaced as `corroborated` and never flagged or parked. Genuine contradictions
+ * split into `contradictions` (LIVE — needs a human) and `dormant` (parked past
+ * the dormancy threshold per Axiom 12 — still visible, never resolved/deleted).
+ * @returns {{ active: object[], history: object[], contradictions: Map<string, object[]>, dormant: Map<string, object[]>, corroborated: Map<string, object[]> }}
  */
 export function classify(claims, today = TODAY, opts = {}) {
   const dormancyDays = opts.dormancyDays ?? DEFAULT_DORMANCY_DAYS;
@@ -134,13 +149,19 @@ export function classify(claims, today = TODAY, opts = {}) {
   }
   const contradictions = new Map();
   const dormant = new Map();
+  const corroborated = new Map();
   for (const [pred, list] of byPredicate) {
     if (list.length > 1) {
-      if (isDormant(list, today, dormancyDays)) dormant.set(pred, list);
-      else contradictions.set(pred, list);
+      if (distinctValues(list) === 1) {
+        corroborated.set(pred, list);            // independent sources agree — Axiom 9
+      } else if (isDormant(list, today, dormancyDays)) {
+        dormant.set(pred, list);
+      } else {
+        contradictions.set(pred, list);
+      }
     }
   }
-  return { active, history, contradictions, dormant, supersededIds, isExpired };
+  return { active, history, contradictions, dormant, corroborated, supersededIds, isExpired };
 }
 
 const byId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -155,10 +176,9 @@ const byId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
  * phrasings are deliberately NOT merged (conservative: do not over-corroborate).
  */
 export function evidenceWeight(claim, list) {
-  const norm = (v) => String(v ?? "").trim().replace(/\s+/g, " ");
-  const target = norm(claim.value);
+  const target = normValue(claim.value);
   const sources = new Set(
-    list.filter((c) => norm(c.value) === target).map((c) => c.source)
+    list.filter((c) => normValue(c.value) === target).map((c) => c.source)
   );
   return sources.size;
 }
@@ -201,9 +221,10 @@ export function governing(list) {
 /** Render the Markdown view body for one entity. */
 export function renderView(entity, claims, today = TODAY) {
   const mine = claims.filter((c) => c.entity === entity.id).sort(byId);
-  const { active, history, contradictions, dormant, supersededIds, isExpired } = classify(mine, today);
+  const { active, history, contradictions, dormant, corroborated, supersededIds, isExpired } = classify(mine, today);
   const contradicted = new Set([...contradictions.keys()]);
   const parked = new Set([...dormant.keys()]);
+  const agreed = new Set([...corroborated.keys()]);
 
   const lines = [];
   lines.push("---");
@@ -224,7 +245,8 @@ export function renderView(entity, claims, today = TODAY) {
   if (entity.canonical) lines.push(`- **Canonical record:** \`${entity.canonical}\``);
   if (entity.claims) lines.push(`- **Claim log:** \`${entity.claims}\``);
   lines.push(`- **Generated:** ${today} · **Active facts:** ${active.length} · ` +
-    `**Contradictions:** ${contradictions.size} · **Dormant:** ${dormant.size} · **History entries:** ${history.length}`);
+    `**Contradictions:** ${contradictions.size} · **Corroborated:** ${corroborated.size} · ` +
+    `**Dormant:** ${dormant.size} · **History entries:** ${history.length}`);
   lines.push("");
 
   // Contradictions first — highest signal.
@@ -277,6 +299,24 @@ export function renderView(entity, claims, today = TODAY) {
   }
   lines.push("");
 
+  // Corroborated facts — >1 active claim on a predicate, all asserting the SAME
+  // value from independent sources (Axiom 9). This is agreement, not conflict:
+  // never flagged, never parked. Surfaced positively because independent
+  // corroboration is the strongest evidence signal (Axiom 10).
+  lines.push("## Corroborated facts (independent sources agree)");
+  lines.push("");
+  if (corroborated.size === 0) {
+    lines.push("_None._");
+  } else {
+    for (const [pred, list] of [...corroborated].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+      const gov = governing(list);
+      const w = evidenceWeight(gov, list);
+      lines.push(`- **\`${pred}\`** ✓ — ${gov.value} _(corroborated by ${w} independent ` +
+        `source${w === 1 ? "" : "s"}: ${[...new Set(list.map((c) => c.source))].sort().join(", ")})_`);
+    }
+  }
+  lines.push("");
+
   // Active facts by predicate.
   lines.push("## Active facts");
   lines.push("");
@@ -285,7 +325,8 @@ export function renderView(entity, claims, today = TODAY) {
   } else {
     for (const c of active.slice().sort((a, b) =>
       a.predicate < b.predicate ? -1 : a.predicate > b.predicate ? 1 : byId(a, b))) {
-      const flag = contradicted.has(c.predicate) ? " ⚠" : parked.has(c.predicate) ? " 💤" : "";
+      const flag = contradicted.has(c.predicate) ? " ⚠" : parked.has(c.predicate) ? " 💤"
+        : agreed.has(c.predicate) ? " ✓" : "";
       const vt = c.valid_to ? `, valid to ${c.valid_to}` : "";
       lines.push(`- **\`${c.predicate}\`**${flag}: ${c.value}  ` +
         `\n  _(${c.confidence}; ${c.id}; from ${c.valid_from}${vt}; source: ${c.source})_` +

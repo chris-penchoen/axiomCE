@@ -71,7 +71,8 @@ lifecycle:
   superseded: "another claim's supersedes == this claim.id"
   retracted: "retracted_at is set (via `runner.mjs retract --id <claim> --reason` — Axiom 24: withdraws a fact as wrong/void, kept in history, audited to runtime/delegated-audit.jsonl; distinct from supersede, which replaces with a newer fact)"
   expired: "valid_to is in the past"
-  contradiction: ">1 active claim sharing the same entity+predicate"
+  contradiction: ">1 active claim on the same entity+predicate asserting MORE THAN ONE distinct value (genuine disagreement). Multiple active claims that all assert the SAME value are corroboration, not contradiction."
+  corroboration: "Axiom 9. >1 active claim on the same entity+predicate all asserting the SAME (whitespace-normalized, case-sensitive) value from independent sources. Agreement, not conflict: surfaced positively as `corroborated`, NEVER flagged or parked, and never routed to the contradiction triage bucket. Independent corroboration is the strongest evidence signal (Axiom 10 evidence weight = distinct-source count)."
   dormant: "A contradiction unresolved past policy.dormancy_days with NO new evidence (Axiom 12). Auto-parked off the active 'needs-you' surface into a still-visible `dormant` bucket. Parking is NOT resolution: both sides are preserved and it reactivates automatically the instant a newer claim touches the predicate. Age = days since the most recent asserted_at on the set."
 
 # ---------------------------------------------------------------------------
@@ -119,7 +120,7 @@ triage:
   buckets: [privacy-hold, needs-clarification, contradiction, ready]
   privacy_hold: "not an explicit public class (restricted/sensitive OR missing/unknown) — you decide; never automated"
   needs_clarification: "confidence unresolved — a human must clarify"
-  contradiction: "promoting would create/join a live contradiction against canon"
+  contradiction: "promoting would create/join a live contradiction against canon (a DIFFERENT value on an existing entity+predicate). A claim that merely corroborates an existing value goes to `ready`, not here."
   ready: "clean: settled confidence, public/personal, no conflict"
   hard_excluded_from_automation: [privacy-hold, needs-clarification]
 
