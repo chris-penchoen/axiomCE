@@ -830,6 +830,59 @@ export function applyCapture(root, planned) {
 // ---------------------------------------------------------------------------
 
 /**
+ * True only for a FINAL, safe-to-read observation drop. A producer publishes
+ * atomically (write a temp/hidden file, fsync, rename into place — see
+ * publishObservation), so an in-progress drop is never a bare `*.jsonl`:
+ *   - must end in `.jsonl`               (final extension)
+ *   - must NOT be hidden (leading `.`)   (the staging convention)
+ *   - must NOT carry a temp/partial/backup marker
+ * This is the consumer half of the atomic-publish contract: it guarantees
+ * `sync`/`sync --watch` never reads a half-written file (rt-atomic-observe).
+ */
+export function isObservationFile(name) {
+  if (typeof name !== "string" || !name.endsWith(".jsonl")) return false;
+  if (name.startsWith(".")) return false;
+  if (/(\.tmp|\.partial|\.swp|~)$/i.test(name) || /\.tmp-/i.test(name)) return false;
+  return true;
+}
+
+/** List final observation files in `dir`, sorted. Skips in-progress drops. */
+export function observationFiles(dir) {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter(isObservationFile).sort();
+}
+
+/**
+ * Reference producer: publish an observation drop ATOMICALLY so a consumer never
+ * reads a half-written file. Writes to a HIDDEN temp in the same directory
+ * (fsynced) then renames into the final name — rename is atomic on one
+ * filesystem, so the `*.jsonl` appears whole or not at all, and the hidden temp
+ * is skipped by isObservationFile if observed mid-flight. Producers written in
+ * another language MUST follow the same contract: write temp+hidden, fsync,
+ * rename to a bare final `*.jsonl`. Never append incrementally to a live
+ * `*.jsonl` in the watched directory.
+ * @returns {string} the final published path
+ */
+export function publishObservation(dir, name, content) {
+  if (typeof name !== "string" || !name.endsWith(".jsonl") || name.startsWith(".") ||
+      name.includes("/") || name.includes("\\") || /\.tmp-|\.(tmp|partial|swp)$|~$/i.test(name)) {
+    throw new Error(`publishObservation: name must be a bare final '*.jsonl' file, got '${name}'`);
+  }
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.${name}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const fd = fs.openSync(tmp, "w");
+  try {
+    fs.writeFileSync(fd, content.endsWith("\n") ? content : content + "\n", { encoding: "utf8" });
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  const final = path.join(dir, name);
+  fs.renameSync(tmp, final);
+  return final;
+}
+
+/**
  * Plan a sync: scan inbox/observations/*.jsonl, dedup against the ledger, run
  * the same gates as capture, and route NEW valid claims toward the ratification
  * queue (never straight to canon). Pure/deterministic — writes nothing.
@@ -849,9 +902,7 @@ export function planSync(root = ROOT, opts = {}) {
   const duplicates = [];
   const problems = [];
 
-  const files = fs.existsSync(dir)
-    ? fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl")).sort()
-    : [];
+  const files = observationFiles(dir);
 
   const entityIds = new Set(loadEntities(root).map((e) => e.id));
   const ledger = loadLedger(root);

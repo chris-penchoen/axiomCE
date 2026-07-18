@@ -125,6 +125,19 @@ triage:
   hard_excluded_from_automation: [privacy-hold, needs-clarification]
 
 # ---------------------------------------------------------------------------
+# Observation ingress + atomic publishing (rt-atomic-observe)
+# ---------------------------------------------------------------------------
+observations:
+  # `sync`/`sync --watch` consume candidate-claim drops from inbox/observations/.
+  # `sync --watch` re-runs on a 300ms debounce, so a producer that writes a live
+  # *.jsonl incrementally can be read half-written. The contract closes that gap.
+  dir: "inbox/observations/"
+  publish_contract: "producers MUST publish atomically: write to a temp/hidden file, fsync, then rename to a bare final '*.jsonl'. Never append incrementally to a live '*.jsonl' in the watched directory. Rename is atomic on one filesystem, so the final file appears whole or not at all."
+  reference_producer: "runner.mjs exports publishObservation(dir, name, content) — the reference implementation of the contract (hidden temp + fsync + rename)"
+  consumer_rule: "the consumer scans FINAL files only (isObservationFile): ends in '.jsonl', not hidden (leading '.'), no temp/partial/backup marker (.tmp/.tmp-*/.partial/.swp/~). In-progress drops are skipped until renamed into place."
+  torn_read_note: "even if a non-conforming producer tears a write, per-record dead-lettering (see dead_letter) means the malformed tail is quarantined per-line and the clean lines still enqueue — the atomic contract is the primary fix, dead-letter is the backstop."
+
+# ---------------------------------------------------------------------------
 # Dead-letter quarantine (rt-dead-letter)
 # ---------------------------------------------------------------------------
 dead_letter:

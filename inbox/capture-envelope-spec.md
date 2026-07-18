@@ -3,7 +3,7 @@ title: Capture Envelope Spec — normalization contract
 type: spec
 classification: public
 created: 2026-07-15
-updated: 2026-07-15
+updated: 2026-07-18
 status: draft
 version: 0.1
 source: framework-reference-example
@@ -37,6 +37,25 @@ the only party that saw the conversation; these rules bind it.
 
 See `../kernel/BOOT.md` (layers, lifecycle, governance) and
 `../kernel/ontology.yaml` (claim schema).
+
+## Publishing an envelope (atomic-drop contract)
+
+An envelope is consumed by `runner.mjs sync` (and `sync --watch`, which re-runs
+on a 300ms debounce). To guarantee the consumer never reads a half-written drop,
+producers **MUST** publish atomically:
+
+- Write the envelope to a **temp or hidden** file in `inbox/observations/`
+  (e.g. `.batch.jsonl.tmp`), flush/fsync it, then **rename** it to a bare final
+  `*.jsonl` name. Rename is atomic on a single filesystem, so the final file
+  appears whole or not at all.
+- Producers **MUST NOT** append incrementally to a live `*.jsonl` in the watched
+  directory.
+- The reference implementation is `publishObservation(dir, name, content)`
+  exported by `tools/runner.mjs` (hidden temp → fsync → rename).
+- The consumer skips any non-final name (hidden, `.tmp`/`.tmp-*`, `.partial`,
+  `.swp`, trailing `~`), so an in-progress drop is ignored until it is renamed
+  into place. A torn write from a non-conforming producer is still contained by
+  per-record dead-lettering, but the atomic contract is the primary fix.
 
 ## Envelope format
 

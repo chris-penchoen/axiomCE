@@ -20,6 +20,9 @@ import {
   loadQueue,
   planSync,
   applySync,
+  publishObservation,
+  observationFiles,
+  isObservationFile,
   applyDeadLetter,
   loadDeadLetter,
   deadLetterKey,
@@ -937,4 +940,67 @@ test("recover: applyRecover only touches repairable findings, leaving canon unto
   writeQueue(dir, [qEntry({ obs_id: "obs-x" }), qEntry({ obs_id: "obs-x" })]);
   applyRecover(dir, planRecover(dir), { now: "2026-07-16T00:00:00Z" });
   assert.equal(fs.readFileSync(path.join(dir, "claims", "organization-fix.jsonl"), "utf8"), canonBefore);
+});
+
+// --- atomic observation publishing (rt-atomic-observe) ---
+test("isObservationFile accepts only final, non-hidden, non-temp .jsonl names", () => {
+  assert.equal(isObservationFile("batch.jsonl"), true);
+  assert.equal(isObservationFile(".staging.jsonl"), false);
+  assert.equal(isObservationFile("batch.jsonl.tmp-123"), false);
+  assert.equal(isObservationFile("batch.jsonl.partial"), false);
+  assert.equal(isObservationFile("batch.txt"), false);
+  assert.equal(isObservationFile("batch.jsonl~"), false);
+});
+
+test("planSync scans only FINAL observation files, skipping in-progress drops", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  const obs = path.join("inbox", "observations");
+  write(dir, path.join(obs, "good.jsonl"), "{}\n");
+  write(dir, path.join(obs, ".staging.jsonl"), "{ half-written");   // hidden staging
+  write(dir, path.join(obs, "drop.jsonl.tmp-9"), "{ half-written"); // temp suffix
+  write(dir, path.join(obs, "notes.txt"), "not an observation");
+  const plan = planSync(dir, {});
+  assert.deepEqual(plan.files, ["good.jsonl"]);
+});
+
+test("observationFiles returns sorted final files only", () => {
+  const dir = tmpDir();
+  const obs = path.join(dir, "inbox", "observations");
+  fs.mkdirSync(obs, { recursive: true });
+  for (const n of ["b.jsonl", "a.jsonl", ".x.jsonl", "c.jsonl.tmp-1"]) fs.writeFileSync(path.join(obs, n), "{}\n");
+  assert.deepEqual(observationFiles(obs), ["a.jsonl", "b.jsonl"]);
+});
+
+test("publishObservation makes a drop appear atomically as a final .jsonl with no leftovers", () => {
+  const dir = tmpDir();
+  const obs = path.join(dir, "inbox", "observations");
+  const p = publishObservation(obs, "batch.jsonl", '{"x":1}');
+  assert.ok(fs.existsSync(p));
+  assert.equal(fs.readFileSync(p, "utf8"), '{"x":1}\n');
+  assert.deepEqual(fs.readdirSync(obs), ["batch.jsonl"]); // no temp/hidden leftovers
+});
+
+test("publishObservation appends a trailing newline only when missing", () => {
+  const obs = path.join(tmpDir(), "obs");
+  const p = publishObservation(obs, "a.jsonl", '{"x":1}\n');
+  assert.equal(fs.readFileSync(p, "utf8"), '{"x":1}\n');
+});
+
+test("publishObservation rejects non-final names (must be a bare *.jsonl)", () => {
+  const obs = path.join(tmpDir(), "obs");
+  for (const bad of [".hidden.jsonl", "sub/dir.jsonl", "file.txt", "file.jsonl.tmp-1", "file.jsonl.partial"]) {
+    assert.throws(() => publishObservation(obs, bad, "{}"), /bare final/);
+  }
+});
+
+test("a published observation is consumed by planSync end-to-end", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  const obs = path.join(dir, "inbox", "observations");
+  const cand = obsClaim({ predicate: "founded", value: "2020" });
+  publishObservation(obs, "drop.jsonl", JSON.stringify(cand));
+  const plan = planSync(dir, {});
+  assert.deepEqual(plan.files, ["drop.jsonl"]);
+  assert.equal(plan.queued.length, 1);
 });
