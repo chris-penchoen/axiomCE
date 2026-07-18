@@ -41,7 +41,7 @@ export const CLAIM_REQUIRED = [
   "id", "entity", "predicate", "value", "confidence",
   "classification", "valid_from", "asserted_at", "source",
 ];
-export const CLAIM_OPTIONAL = ["valid_to", "retracted_at", "supersedes", "note"];
+export const CLAIM_OPTIONAL = ["valid_to", "retracted_at", "retraction_reason", "supersedes", "note"];
 const CLAIM_ALLOWED = new Set([...CLAIM_REQUIRED, ...CLAIM_OPTIONAL]);
 
 const CLAIM_DIRS = ["claims", path.join("private", "claims")];
@@ -113,6 +113,15 @@ export function validateClaimShape(c) {
       p.push(`invalid supersedes id: "${c.supersedes}"`);
     } else if (c.supersedes === c.id) {
       p.push(`claim supersedes itself: ${c.id}`);
+    }
+  }
+  // retraction_reason: optional free text, but if present must be a non-empty
+  // string and only meaningful alongside retracted_at (an audited tombstone).
+  if (c.retraction_reason !== undefined && c.retraction_reason !== null) {
+    if (typeof c.retraction_reason !== "string" || c.retraction_reason.trim() === "") {
+      p.push("retraction_reason must be a non-empty string when present");
+    } else if (!c.retracted_at) {
+      p.push("retraction_reason set without retracted_at (a reason must accompany a retraction)");
     }
   }
   return p;

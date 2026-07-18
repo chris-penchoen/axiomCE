@@ -31,7 +31,7 @@ entity:
 # ---------------------------------------------------------------------------
 claim:
   required: [id, entity, predicate, value, confidence, classification, valid_from, asserted_at, source]
-  optional: [valid_to, retracted_at, supersedes, note]
+  optional: [valid_to, retracted_at, retraction_reason, supersedes, note]
   fields:
     id:             "clm-<domain>-NNNN, stable and unique"
     entity:         "an entity_id"
@@ -43,6 +43,7 @@ claim:
     valid_to:       "YYYY-MM-DD or null — null = still current"
     asserted_at:    "ISO timestamp — when recorded"
     retracted_at:   "ISO timestamp or null — when withdrawn"
+    retraction_reason: "free text; required when retracted_at is set (Axiom 24 audited retraction)"
     supersedes:     "claim id this replaces, or null"
     source:         "source-record id or canonical entity id (MUST be present)"
     note:           "optional free prose"
@@ -68,7 +69,7 @@ confidence:
 lifecycle:
   active: "retracted_at is null AND not superseded by another claim AND (valid_to is null or >= today)"
   superseded: "another claim's supersedes == this claim.id"
-  retracted: "retracted_at is set"
+  retracted: "retracted_at is set (via `runner.mjs retract --id <claim> --reason` — Axiom 24: withdraws a fact as wrong/void, kept in history, audited to runtime/delegated-audit.jsonl; distinct from supersede, which replaces with a newer fact)"
   expired: "valid_to is in the past"
   contradiction: ">1 active claim sharing the same entity+predicate"
   dormant: "A contradiction unresolved past policy.dormancy_days with NO new evidence (Axiom 12). Auto-parked off the active 'needs-you' surface into a still-visible `dormant` bucket. Parking is NOT resolution: both sides are preserved and it reactivates automatically the instant a newer claim touches the predicate. Age = days since the most recent asserted_at on the set."

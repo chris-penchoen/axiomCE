@@ -1170,12 +1170,109 @@ export function applyAutoRatify(root = ROOT, plan) {
 }
 
 // ---------------------------------------------------------------------------
+// retract (Axiom 24): tombstone an active canonical claim with an audited reason
+// ---------------------------------------------------------------------------
+
+/**
+ * Plan a retraction: locate ACTIVE canonical claims by id and mark them for
+ * tombstoning. Pure/deterministic — writes nothing.
+ *
+ * A claim can be retracted only if it is currently active (not already
+ * retracted, not superseded, not expired). Retracting history is a no-op we
+ * surface as a problem so the operator knows nothing happened. Supersession and
+ * retraction are distinct: supersede replaces a fact with a newer one; retract
+ * withdraws a fact as wrong/void, keeping it in history (classify honors both).
+ *
+ * @param {string} root
+ * @param {{ ids?:string[], today?:string }} opts  ids match claim.id
+ * @returns {{ retract:object[], problems:object[] }}
+ */
+export function planRetract(root = ROOT, opts = {}) {
+  const today = opts.today || TODAY;
+  const canon = loadClaims(root);
+  const byId = new Map(canon.map((c) => [c.id, c]));
+  // Compute the active set with per-entity classify so supersession/expiry are
+  // honored exactly as the view engine sees them.
+  const byEntity = new Map();
+  for (const c of canon) {
+    if (!byEntity.has(c.entity)) byEntity.set(c.entity, []);
+    byEntity.get(c.entity).push(c);
+  }
+  const activeIds = new Set();
+  for (const [, list] of byEntity)
+    for (const c of classify(list, today).active) activeIds.add(c.id);
+
+  const retract = [];
+  const problems = [];
+  for (const id of opts.ids || []) {
+    const claim = byId.get(id);
+    if (!claim) { problems.push({ id, msg: "not found in canon" }); continue; }
+    if (claim.retracted_at) { problems.push({ id, msg: "already retracted" }); continue; }
+    if (!activeIds.has(id)) {
+      problems.push({ id, msg: "not active (superseded or expired) — nothing to retract" });
+      continue;
+    }
+    const target = path.relative(root, claimLogPath(claim.entity, claim.classification, root));
+    retract.push({ claim, target, private: !PUBLIC_CLASSES.has(claim.classification) });
+  }
+  return { retract, problems };
+}
+
+/**
+ * Apply a retraction: set retracted_at + retraction_reason on each targeted
+ * claim IN PLACE (rewrite its canon log atomically), then append an audit
+ * record routed public/private. Claims already carrying retracted_at are left
+ * untouched (idempotent on retry). Caller regenerates views.
+ *
+ * @param {string} root
+ * @param {object} plan output of planRetract()
+ * @param {{ now?:string, reason:string }} opts
+ * @returns {{ retracted:object[] }}
+ */
+export function applyRetract(root = ROOT, plan, opts = {}) {
+  const now = opts.now || new Date().toISOString();
+  const reason = opts.reason;
+  if (!reason || typeof reason !== "string" || reason.trim() === "") {
+    throw new Error("applyRetract requires a non-empty reason (Axiom 24: retraction must be audited).");
+  }
+  const privById = new Map(plan.retract.map((r) => [r.claim.id, r.private]));
+  // Group targeted ids by their canon log so each file is rewritten once.
+  const byTarget = new Map();
+  for (const r of plan.retract) {
+    if (!byTarget.has(r.target)) byTarget.set(r.target, new Set());
+    byTarget.get(r.target).add(r.claim.id);
+  }
+  const retracted = [];
+  for (const [rel, idset] of byTarget) {
+    const abs = path.join(root, rel);
+    const claims = readJsonl(abs);
+    let changed = false;
+    for (const c of claims) {
+      if (idset.has(c.id) && !c.retracted_at) {
+        c.retracted_at = now;
+        c.retraction_reason = reason;
+        changed = true;
+        retracted.push({ id: c.id, target: rel });
+      }
+    }
+    if (changed) writeJsonl(abs, claims);
+  }
+  // Audit trail (reuse the append-only, privacy-routed audit log).
+  const audit = retracted.map((r) => ({
+    claim_id: r.id, private: privById.get(r.id) === true,
+    action: "retract", reason, decided_at: now,
+  }));
+  writeAuditLog(root, audit);
+  return { retracted };
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
   const out = { _: [], entity: [], adapter: null, includePrivate: false, apply: false, out: null,
-                watch: false, ids: [], all: false, discard: false, trust: false,
+                watch: false, ids: [], all: false, discard: false, trust: false, reason: null,
                 autoReady: false, ceiling: null, ratio: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -1188,6 +1285,7 @@ function parseArgs(argv) {
     else if (a === "--id") out.ids.push(argv[++i]);
     else if (a === "--all") out.all = true;
     else if (a === "--discard") out.discard = true;
+    else if (a === "--reason") out.reason = argv[++i];
     else if (a === "--auto-ready") out.autoReady = true;
     else if (a === "--ceiling") out.ceiling = argv[++i];
     else if (a === "--ratio") out.ratio = Number(argv[++i]);
@@ -1326,6 +1424,35 @@ function runRatify(opts) {
   process.exit(0);
 }
 
+function runRetract(opts) {
+  if (opts.ids.length === 0) {
+    console.error("retract: specify one/more --id <claim_id> and a --reason \"<why>\".");
+    process.exit(1);
+  }
+  if (!opts.reason || opts.reason.trim() === "") {
+    console.error("retract: --reason \"<why>\" is required (Axiom 24: retraction must be audited).");
+    process.exit(1);
+  }
+  const plan = planRetract(ROOT, { ids: opts.ids });
+  for (const p of plan.problems) console.error(`FAIL ${p.id}: ${p.msg}`);
+  if (plan.retract.length === 0) {
+    console.log("retract: nothing to retract (no active claim matched).");
+    process.exit(plan.problems.length ? 1 : 0);
+  }
+  if (!opts.apply) {
+    console.log(`retract (dry-run): would tombstone ${plan.retract.length} active claim(s):`);
+    for (const r of plan.retract) console.log(`  ${r.claim.id} (${r.claim.confidence}, ${r.claim.classification}) -> ${r.target}`);
+    console.log(`  reason: ${opts.reason}`);
+    console.log("\nRe-run with --apply to retract (audited; kept in history — reversible by capturing a fresh claim).");
+    process.exit(plan.problems.length ? 1 : 0);
+  }
+  const { retracted } = withWriterLock(ROOT, () => applyRetract(ROOT, plan, { reason: opts.reason }));
+  for (const r of retracted) console.log(`retracted ${r.id} -> ${r.target}`);
+  generateAll(ROOT, { check: false });
+  console.log(`\nretract: ${retracted.length} claim(s) tombstoned (audited); views regenerated.`);
+  process.exit(0);
+}
+
 // Privacy-safe queue-item label for console output: id + confidence +
 // classification + target ONLY — never the claim VALUE (mirrors ratify dry-run).
 function queueLabel(q) {
@@ -1415,6 +1542,7 @@ if (isMain) {
   }
   else if (cmd === "sync") runSync(opts);
   else if (cmd === "ratify") runRatify(opts);
+  else if (cmd === "retract") runRetract(opts);
   else if (cmd === "triage") runTriage(opts);
   else if (cmd === "auto-ratify") runAutoRatify(opts);
   else {
@@ -1424,6 +1552,7 @@ if (isMain) {
       "  runner.mjs import-canonical <envelope.jsonl> --trust [--apply]   # PRIVILEGED: writes straight to canon, bypasses ratification",
       "  runner.mjs sync [--apply] [--watch]                 # observe inbox/observations/ -> ratification queue",
       "  runner.mjs ratify (--all | --id <id>...) [--discard] [--apply]   # promote queued claims into canon",
+      "  runner.mjs retract --id <claim_id>... --reason \"<why>\" [--apply]   # tombstone an active canonical claim (Axiom 24; audited, kept in history)",
       "  runner.mjs triage                                   # sort the pending queue into buckets (where you're needed)",
       "  runner.mjs auto-ratify [--auto-ready] [--ceiling <class>] [--ratio <n>] [--apply]  # delegated ratification (Axiom 18; default: fully manual)",
     ].join("\n"));

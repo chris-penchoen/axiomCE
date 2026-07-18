@@ -30,6 +30,8 @@ import {
   decisiveResolution,
   planAutoRatify,
   applyAutoRatify,
+  planRetract,
+  applyRetract,
 } from "./runner.mjs";
 
 function tmpDir() {
@@ -673,3 +675,60 @@ test("applyAutoRatify promotes only the ready autoRatify set into canon and writ
   assert.ok(audit.some((a) => a.claim_id === "clm-fix-0010" && a.action === "auto-ratify"));
 });
 
+
+// --- retract (Axiom 24) ---
+function readClaimsFile(dir, rel) {
+  const abs = path.join(dir, rel);
+  if (!fs.existsSync(abs)) return [];
+  return fs.readFileSync(abs, "utf8").split(/\r?\n/).filter((l) => l.trim()).map((l) => JSON.parse(l));
+}
+
+test("planRetract targets an active claim; problems for missing/superseded/already-retracted", () => {
+  const dir = tmpDir();
+  seedStore(dir); // one active claim clm-fix-0001
+  // add a superseded claim + its superseder, and an already-retracted claim
+  const extra = [
+    claim({ id: "clm-fix-0002", predicate: "size", value: "S" }),
+    claim({ id: "clm-fix-0003", predicate: "size", value: "M", supersedes: "clm-fix-0002" }),
+    claim({ id: "clm-fix-0004", predicate: "shape", value: "round", retracted_at: "2026-05-01T00:00:00Z", retraction_reason: "old" }),
+  ];
+  fs.appendFileSync(path.join(dir, "claims/organization-fix.jsonl"), extra.map((c) => JSON.stringify(c)).join("\n") + "\n");
+
+  const plan = planRetract(dir, { ids: ["clm-fix-0001", "clm-fix-0002", "clm-fix-0004", "clm-nope-9999"], today: TODAY });
+  assert.deepEqual(plan.retract.map((r) => r.claim.id), ["clm-fix-0001"]);
+  const byId = Object.fromEntries(plan.problems.map((p) => [p.id, p.msg]));
+  assert.match(byId["clm-fix-0002"], /not active/);
+  assert.match(byId["clm-fix-0004"], /already retracted/);
+  assert.match(byId["clm-nope-9999"], /not found/);
+});
+
+test("applyRetract sets retracted_at + retraction_reason in place and audits", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  const plan = planRetract(dir, { ids: ["clm-fix-0001"], today: TODAY });
+  const { retracted } = applyRetract(dir, plan, { now: "2026-07-14T12:00:00Z", reason: "misheard the color" });
+  assert.deepEqual(retracted.map((r) => r.id), ["clm-fix-0001"]);
+  const c = readClaimsFile(dir, "claims/organization-fix.jsonl").find((x) => x.id === "clm-fix-0001");
+  assert.equal(c.retracted_at, "2026-07-14T12:00:00Z");
+  assert.equal(c.retraction_reason, "misheard the color");
+  // audit routed to public runtime (personal claim -> public partition)
+  const audit = readClaimsFile(dir, "runtime/delegated-audit.jsonl");
+  assert.ok(audit.some((a) => a.claim_id === "clm-fix-0001" && a.action === "retract" && a.reason === "misheard the color"));
+});
+
+test("applyRetract requires a non-empty reason", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  const plan = planRetract(dir, { ids: ["clm-fix-0001"], today: TODAY });
+  assert.throws(() => applyRetract(dir, plan, { reason: "" }), /reason/);
+});
+
+test("a retracted claim drops out of the active set (classify honors retracted_at)", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  const before = assembleContext(dir, { today: TODAY }).markdown;
+  assert.ok(before.includes("blue"));
+  applyRetract(dir, planRetract(dir, { ids: ["clm-fix-0001"], today: TODAY }), { now: "2026-07-14T12:00:00Z", reason: "wrong" });
+  const after = assembleContext(dir, { today: TODAY }).markdown;
+  assert.ok(!after.includes("blue"));
+});
