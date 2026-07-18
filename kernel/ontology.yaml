@@ -138,6 +138,27 @@ observations:
   torn_read_note: "even if a non-conforming producer tears a write, per-record dead-lettering (see dead_letter) means the malformed tail is quarantined per-line and the clean lines still enqueue — the atomic contract is the primary fix, dead-letter is the backstop."
 
 # ---------------------------------------------------------------------------
+# Identity: observation vs fact (rt-fact-vs-obs-identity)
+# ---------------------------------------------------------------------------
+identity:
+  # Two DISTINCT identities are computed per candidate; conflating them loses
+  # the difference between a duplicate capture and a corroborating re-observation.
+  obs_id:
+    fn: "candidateHash(obj) -> 'obs-<32 hex>' (128-bit)"
+    scope: "the OBSERVATION — one exact capture envelope"
+    fields: "entity, predicate, value, confidence, classification, valid_from, valid_to, retracted_at, supersedes, note, source"
+    use: "idempotency/dedup key: a byte-identical re-capture (same source, note, confidence) is a guaranteed no-op"
+  fact_fp:
+    fn: "factFingerprint(obj) -> 'fact-<32 hex>' (128-bit)"
+    scope: "the ASSERTED FACT — independent of who/when/how it was observed"
+    fields: "entity, predicate, value, valid_from, valid_to"
+    excludes: "source, note, confidence, asserted_at, retracted_at, supersedes, classification — these are observation-level, not fact identity"
+    use: "recognize that two independent observations assert the SAME fact -> corroboration (Axiom 9), not new evidence"
+  evidence_label: "planSync tags each queued candidate: 'new-evidence' when its fact_fp is unseen in canon+queue (this run included), else 're-observed' (a novel capture of a fact we already hold). plan.reobserved counts the latter; sync surfaces it. Both fact_fp and evidence are persisted into the queue entry and the ledger record."
+  reobservation_rule: "a re-observation still enqueues (it adds independent provenance / corroboration weight); the label makes it explicit so a ratifier can distinguish 'the model restated a known fact' from 'genuinely new evidence'. A DIFFERENT value is a different fact_fp -> always 'new-evidence' (a competing/updating claim)."
+
+
+# ---------------------------------------------------------------------------
 # Dead-letter quarantine (rt-dead-letter)
 # ---------------------------------------------------------------------------
 dead_letter:

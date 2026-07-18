@@ -111,6 +111,36 @@ export function candidateHash(obj) {
 }
 
 /**
+ * Stable fingerprint for the underlying ASSERTED FACT, independent of the
+ * observation envelope. This is a different identity from `obs_id`
+ * (candidateHash): two independent observations of the same fact — differing
+ * only in source, note, confidence, asserted_at, or retraction status — share
+ * one fact_fingerprint but have distinct obs_ids.
+ *
+ * A fact is (entity, predicate, value) asserted over a validity window. We
+ * deliberately EXCLUDE:
+ *   - source / note / confidence  → observation-level provenance, not identity
+ *   - asserted_at                 → when it was seen, not what was asserted
+ *   - retracted_at / supersedes   → status ABOUT a fact, not a new fact
+ *   - classification              → a handling label, not fact identity
+ * so that re-observing the same fact is recognizable as corroboration
+ * (Axiom 9) rather than mistaken for new evidence.
+ * @param {object} obj a parsed candidate/claim
+ * @returns {string} e.g. "fact-1a2b3c4d5e6f7a8b" (128-bit)
+ */
+export function factFingerprint(obj) {
+  const fact = {
+    entity: obj.entity ?? null,
+    predicate: obj.predicate ?? null,
+    value: obj.value ?? null,
+    valid_from: obj.valid_from ?? null,
+    valid_to: obj.valid_to ?? null,
+  };
+  const canon = JSON.stringify(fact, Object.keys(fact).sort());
+  return "fact-" + crypto.createHash("sha256").update(canon).digest("hex").slice(0, 32);
+}
+
+/**
  * Read a JSONL file into parsed objects (skips blank/`//` lines). Operational
  * files (ledger/queue/canon) are machine-written, so a malformed line means
  * corruption — surface it loudly rather than silently forgetting state.
@@ -914,6 +944,14 @@ export function planSync(root = ROOT, opts = {}) {
   // Seed minting from canon + already-queued claims so new ids stay sequential
   // and never collide with pending (not-yet-ratified) claims.
   const known = [...loadClaims(root), ...loadQueue(root).map((q) => ({ id: q.claim.id }))];
+  // Known FACT fingerprints (canon + pending queue) — used to distinguish a
+  // genuinely new fact from a re-observation of one we already hold. Distinct
+  // from obs_id dedup, which only catches a byte-identical capture envelope.
+  const knownFacts = new Set([
+    ...loadClaims(root).map(factFingerprint),
+    ...loadQueue(root).map((q) => factFingerprint(q.claim)),
+  ]);
+  const seenFactsThisRun = new Set();
   const mintedIds = [];
   const seenThisRun = new Set();
 
@@ -956,8 +994,16 @@ export function planSync(root = ROOT, opts = {}) {
       for (const m of res.problems) fail(m);
       // Only fully-clean candidates are queued (sync may run unattended).
       if (res.shapeOk && res.problems.length === 0) {
+        const factFp = factFingerprint(obj);
+        // A distinct capture (novel obs_id) whose FACT we already hold is a
+        // re-observation (corroboration, no new evidence); otherwise new.
+        const evidence = (knownFacts.has(factFp) || seenFactsThisRun.has(factFp))
+          ? "re-observed" : "new-evidence";
+        seenFactsThisRun.add(factFp);
         queued.push({
           obs_id: obsId,
+          fact_fp: factFp,
+          evidence,
           claim: obj,
           target: res.target,
           private: res.private,
@@ -969,7 +1015,8 @@ export function planSync(root = ROOT, opts = {}) {
     });
   }
 
-  return { queued, duplicates, problems, files, deadLetters: [...dlMap.values()], quarantinedSkipped };
+  return { queued, duplicates, problems, files, deadLetters: [...dlMap.values()], quarantinedSkipped,
+    reobserved: queued.filter((q) => q.evidence === "re-observed").length };
 }
 
 /**
@@ -1005,6 +1052,8 @@ export function applySync(root = ROOT, plan, opts = {}) {
     const key = String(q.private);
     queueBucket[key].push({
       obs_id: q.obs_id,
+      fact_fp: q.fact_fp,
+      evidence: q.evidence,
       claim: q.claim,
       target: q.target,
       private: q.private,
@@ -1014,6 +1063,8 @@ export function applySync(root = ROOT, plan, opts = {}) {
     });
     ledgerBucket[key].push({
       obs_id: q.obs_id,
+      fact_fp: q.fact_fp,
+      evidence: q.evidence,
       claim_id: q.claim.id,
       status: "queued",
       classification: q.claim.classification,
@@ -1773,7 +1824,8 @@ function runSync(opts) {
 
     if (!opts.apply) {
       console.log(`sync (dry-run): ${plan.queued.length} new claim(s) would be queued, ${plan.duplicates.length} duplicate(s) skipped, ${plan.deadLetters.length} would be quarantined (${plan.problems.length} problem msg(s)), ${plan.quarantinedSkipped} already quarantined.`);
-      for (const q of plan.queued) console.log(`  + ${q.claim.id} <- ${q.source_file}:${q.line}  (${q.claim.confidence}, ${q.claim.classification})${q.private ? " [private]" : ""} -> queue`);
+      if (plan.reobserved) console.log(`  of those, ${plan.reobserved} re-observation(s) of known fact(s) (corroboration, not new evidence).`);
+      for (const q of plan.queued) console.log(`  + ${q.claim.id} <- ${q.source_file}:${q.line}  (${q.claim.confidence}, ${q.claim.classification})${q.private ? " [private]" : ""}${q.evidence === "re-observed" ? " [re-observed]" : ""} -> queue`);
       for (const d of plan.deadLetters) console.log(`  ! ${d.source_file}:${d.line} -> dead-letter (${d.problems.length} problem(s))`);
       if (plan.queued.length) console.log(`\nRe-run with --apply to enqueue, then: node tools/runner.mjs ratify --all`);
       return plan;
@@ -1787,6 +1839,7 @@ function runSync(opts) {
     });
     const dlCount = plan.deadLetters.length;
     console.log(`sync: ${queuedCount} claim(s) enqueued for ratification; ${plan.duplicates.length} duplicate(s) skipped; ${dlCount} quarantined to dead-letter; ${plan.quarantinedSkipped} already quarantined. Manifest: ${runManifestPath}`);
+    if (plan.reobserved) console.log(`  (${plan.reobserved} were re-observation(s) of known fact(s) — corroboration, not new evidence.)`);
     if (queuedCount) console.log(`Review: node tools/runner.mjs ratify --all   (or --id <clm-...>)`);
     if (dlCount) console.log(`Quarantined (fix the source line, then re-sync): node tools/runner.mjs dead-letter`);
     return plan;

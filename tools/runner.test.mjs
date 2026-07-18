@@ -19,6 +19,7 @@ import {
   planCapture,
   applyCapture,
   candidateHash,
+  factFingerprint,
   loadLedger,
   loadQueue,
   planSync,
@@ -1091,4 +1092,86 @@ test("privacy leak: a sensitive dead-lettered candidate never lands in a tracked
   for (const f of walk(pubRuntime)) {
     assert.ok(!fs.readFileSync(f, "utf8").includes("LEAKCANARY"), `canary leaked into tracked ${path.relative(dir, f)}`);
   }
+});
+
+// --- fact identity vs observation identity (rt-fact-vs-obs-identity) ---
+
+test("factFingerprint ignores the observation envelope (source/note/confidence/asserted_at/retraction)", () => {
+  const base = { entity: "person:x", predicate: "role", value: "founder", valid_from: "2020-01-01" };
+  const a = factFingerprint({ ...base, source: "chatgpt", note: "n1", confidence: "high", asserted_at: "2026-01-01" });
+  const b = factFingerprint({ ...base, source: "claude", note: "n2", confidence: "medium", asserted_at: "2026-07-14", retracted_at: "2026-08-01T00:00:00Z" });
+  assert.equal(a, b, "same fact under different observation envelopes must share one fingerprint");
+  assert.match(a, /^fact-[0-9a-f]{32}$/);
+});
+
+test("factFingerprint changes when the asserted fact changes (entity/predicate/value/validity)", () => {
+  const base = { entity: "person:x", predicate: "role", value: "founder", valid_from: "2020-01-01", valid_to: null };
+  const fp = factFingerprint(base);
+  assert.notEqual(fp, factFingerprint({ ...base, entity: "person:y" }));
+  assert.notEqual(fp, factFingerprint({ ...base, predicate: "title" }));
+  assert.notEqual(fp, factFingerprint({ ...base, value: "advisor" }));
+  assert.notEqual(fp, factFingerprint({ ...base, valid_from: "2021-01-01" }));
+  assert.notEqual(fp, factFingerprint({ ...base, valid_to: "2025-01-01" }));
+});
+
+test("fact_fp and obs_id are independent identities (same fact, different capture)", () => {
+  const f = { entity: "person:x", predicate: "role", value: "founder" };
+  const o1 = candidateHash({ ...f, source: "chatgpt", note: "a" });
+  const o2 = candidateHash({ ...f, source: "claude", note: "b" });
+  assert.notEqual(o1, o2, "different envelopes -> different observation ids");
+  assert.equal(factFingerprint({ ...f, source: "chatgpt" }), factFingerprint({ ...f, source: "claude" }),
+    "...but the same underlying fact");
+});
+
+test("planSync labels a re-observation of a canon fact as 're-observed' (corroboration, not new)", () => {
+  const dir = tmpDir();
+  seedStore(dir); // canon holds clm-fix-0001: organization:fix / color / blue / valid_from 2026-01-01
+  // Re-observe the SAME fact from a different source (distinct capture envelope).
+  observe(dir, "obs1.jsonl", [obsClaim({
+    entity: "organization:fix", predicate: "color", value: "blue", valid_from: "2026-01-01",
+    source: "a-different-source", note: "restated",
+  })]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(plan.queued.length, 1);
+  assert.equal(plan.queued[0].evidence, "re-observed");
+  assert.equal(plan.reobserved, 1);
+});
+
+test("planSync labels a genuinely different value as 'new-evidence'", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [obsClaim({
+    entity: "organization:fix", predicate: "color", value: "green", valid_from: "2026-01-01",
+  })]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(plan.queued[0].evidence, "new-evidence");
+  assert.equal(plan.reobserved, 0);
+});
+
+test("two new observations of the same fact in one batch: first new, second re-observed", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [
+    obsClaim({ entity: "organization:fix", predicate: "novel-pred", value: "V", source: "s1" }),
+    obsClaim({ entity: "organization:fix", predicate: "novel-pred", value: "V", source: "s2" }),
+  ]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(plan.queued.length, 2);
+  assert.equal(plan.queued[0].evidence, "new-evidence");
+  assert.equal(plan.queued[1].evidence, "re-observed");
+});
+
+test("applySync persists fact_fp and evidence into both the queue and the ledger", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [obsClaim({ entity: "organization:fix", predicate: "p9", value: "v9" })]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  applySync(dir, plan, { now: "2026-07-15T00:00:00Z" });
+  const q = loadQueue(dir);
+  assert.equal(q.length, 1);
+  assert.match(q[0].fact_fp, /^fact-[0-9a-f]{32}$/);
+  assert.equal(q[0].evidence, "new-evidence");
+  const ledgerLine = fs.readFileSync(path.join(dir, "runtime", "ledger.jsonl"), "utf8").trim();
+  assert.match(ledgerLine, /"fact_fp":"fact-/);
+  assert.match(ledgerLine, /"evidence":"new-evidence"/);
 });
