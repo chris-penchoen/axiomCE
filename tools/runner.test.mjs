@@ -35,6 +35,8 @@ import {
   applyAutoRatify,
   planRetract,
   applyRetract,
+  planRecover,
+  applyRecover,
   RUNTIME_SCHEMA_VERSION,
   readSchemaVersion,
   ensureSchema,
@@ -837,4 +839,102 @@ test("MIGRATIONS form a contiguous chain from 0 to the current version", () => {
   let v = 0;
   for (const m of MIGRATIONS) { assert.equal(m.from, v); v = m.to; }
   assert.equal(v, RUNTIME_SCHEMA_VERSION);
+});
+
+// --- recover: runtime state reconciliation (rt-recovery-reconcile) ---
+function qEntry(over = {}) {
+  return {
+    obs_id: "obs-aaa",
+    claim: claim({ id: "clm-fix-0001" }),
+    target: "claims/organization-fix.jsonl",
+    private: false,
+    source_file: "inbox/observations/x.jsonl",
+    line: 1,
+    queued_at: "2026-07-15T00:00:00Z",
+    ...over,
+  };
+}
+function writeQueue(dir, entries, priv = false) {
+  const rel = priv ? "private/runtime/ratification-queue.jsonl" : "runtime/ratification-queue.jsonl";
+  write(dir, rel, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+}
+function writeLedger(dir, entries, priv = false) {
+  const rel = priv ? "private/runtime/ledger.jsonl" : "runtime/ledger.jsonl";
+  write(dir, rel, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+}
+
+test("recover: a store with only direct-capture canon reports info-only (no false alarms)", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  const { findings } = planRecover(dir);
+  assert.ok(findings.every((f) => f.severity === "info"), "no repairable/manual findings on a clean store");
+  assert.ok(findings.some((f) => f.type === "ORPHAN_CANON" && f.claim_id === "clm-fix-0001"));
+});
+
+test("recover: duplicate obs_ids in the queue are detected and de-duplicated", () => {
+  const dir = tmpDir();
+  const q = qEntry({ obs_id: "obs-dup" });
+  writeQueue(dir, [q, q]);
+  const plan = planRecover(dir);
+  const dup = plan.findings.find((f) => f.type === "DUPLICATE_OBS_IN_QUEUE");
+  assert.ok(dup && dup.severity === "repairable");
+  applyRecover(dir, planRecover(dir), { now: "2026-07-16T00:00:00Z" });
+  assert.equal(loadQueue(dir).filter((e) => e.obs_id === "obs-dup").length, 1);
+});
+
+test("recover: a queued-then-ratified obs left in the queue is swept (STALE_QUEUE_ENTRY)", () => {
+  const dir = tmpDir();
+  writeQueue(dir, [qEntry({ obs_id: "obs-stale" })]);
+  writeLedger(dir, [{ obs_id: "obs-stale", claim_id: "clm-fix-0001", status: "ratified", ratified_at: "2026-07-15T00:00:00Z" }]);
+  const plan = planRecover(dir);
+  assert.ok(plan.findings.some((f) => f.type === "STALE_QUEUE_ENTRY" && f.severity === "repairable"));
+  applyRecover(dir, planRecover(dir), { now: "2026-07-16T00:00:00Z" });
+  assert.equal(loadQueue(dir).some((e) => e.obs_id === "obs-stale"), false);
+});
+
+test("recover: a queue entry with no ledger record gets a reconciling 'queued' record (UNTRACKED_QUEUE)", () => {
+  const dir = tmpDir();
+  writeQueue(dir, [qEntry({ obs_id: "obs-untracked" })]);
+  assert.ok(planRecover(dir).findings.some((f) => f.type === "UNTRACKED_QUEUE"));
+  applyRecover(dir, planRecover(dir), { now: "2026-07-16T00:00:00Z" });
+  const rec = loadLedger(dir).get("obs-untracked");
+  assert.equal(rec.status, "queued");
+  assert.equal(rec.reconciled, true);
+  assert.equal(loadQueue(dir).length, 1, "queue entry is preserved, not removed");
+});
+
+test("recover: ledger stuck at 'queued' but claim already in canon is reconciled to 'ratified' (LEDGER_BEHIND_CANON)", () => {
+  const dir = tmpDir();
+  seedStore(dir); // canon has clm-fix-0001
+  writeLedger(dir, [{ obs_id: "obs-behind", claim_id: "clm-fix-0001", status: "queued", first_seen: "2026-07-15T00:00:00Z" }]);
+  assert.ok(planRecover(dir).findings.some((f) => f.type === "LEDGER_BEHIND_CANON"));
+  applyRecover(dir, planRecover(dir), { now: "2026-07-16T00:00:00Z" });
+  const rec = loadLedger(dir).get("obs-behind");
+  assert.equal(rec.status, "ratified");
+  assert.equal(rec.reconciled, true);
+});
+
+test("recover: a lost pending payload is flagged MANUAL and never auto-changed (LOST_QUEUED)", () => {
+  const dir = tmpDir();
+  writeLedger(dir, [{ obs_id: "obs-lost", claim_id: "clm-fix-9999", status: "queued", first_seen: "2026-07-15T00:00:00Z" }]);
+  const f = planRecover(dir).findings.find((x) => x.type === "LOST_QUEUED");
+  assert.ok(f && f.severity === "manual" && f.repair === null);
+  const { applied } = applyRecover(dir, planRecover(dir), { now: "2026-07-16T00:00:00Z" });
+  assert.equal(applied.some((a) => a.type === "LOST_QUEUED"), false);
+});
+
+test("recover: ledger ratified but claim absent from canon is flagged MANUAL (LOST_CANON)", () => {
+  const dir = tmpDir();
+  writeLedger(dir, [{ obs_id: "obs-gone", claim_id: "clm-fix-8888", status: "ratified", ratified_at: "2026-07-15T00:00:00Z" }]);
+  const f = planRecover(dir).findings.find((x) => x.type === "LOST_CANON");
+  assert.ok(f && f.severity === "manual");
+});
+
+test("recover: applyRecover only touches repairable findings, leaving canon untouched", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  const canonBefore = fs.readFileSync(path.join(dir, "claims", "organization-fix.jsonl"), "utf8");
+  writeQueue(dir, [qEntry({ obs_id: "obs-x" }), qEntry({ obs_id: "obs-x" })]);
+  applyRecover(dir, planRecover(dir), { now: "2026-07-16T00:00:00Z" });
+  assert.equal(fs.readFileSync(path.join(dir, "claims", "organization-fix.jsonl"), "utf8"), canonBefore);
 });

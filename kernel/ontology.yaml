@@ -154,6 +154,31 @@ schema_version:
   manifest: "each run manifest records schema_version for traceability"
 
 # ---------------------------------------------------------------------------
+# Recovery / state reconciliation (rt-recovery-reconcile)
+# ---------------------------------------------------------------------------
+recover:
+  # The runtime has three state layers — ledger (append-only status log, latest
+  # wins per obs_id), ratification-queue (pending claims), and canon (ratified
+  # claims). An interrupted write, a manual edit, or a partial cross-machine
+  # restore can leave them out of step. `runner.mjs recover` detects the
+  # divergence read-only; `recover --apply` performs ONLY deterministic,
+  # provenance-preserving repairs under the writer lock (append-only on the
+  # ledger, removal-only on the queue — canon is NEVER modified).
+  command: "runner.mjs recover [--apply] [--verbose]"
+  severities: "repairable = a safe automatic fix exists; manual = real data loss, a human must re-observe/re-ratify (never auto); info = benign + expected"
+  repairable:
+    DUPLICATE_OBS_IN_QUEUE: "same obs_id enqueued more than once -> keep the first, drop the rest (obs_id == identical semantic content)"
+    STALE_QUEUE_ENTRY: "ledger already ratified/discarded but the entry is still queued (crash after the ledger append, before the queue removal) -> remove it"
+    UNTRACKED_QUEUE: "queue entry with no ledger record (enqueue half-committed) -> append a 'queued' ledger record marked reconciled:true"
+    LEDGER_BEHIND_CANON: "ledger stuck at 'queued' but the claim is already in canon -> append a 'ratified' ledger record marked reconciled:true"
+  manual:
+    LOST_QUEUED: "ledger says queued but the payload is in neither queue nor canon — the pending claim body is gone (the ledger stores only ids); re-observe the source"
+    LOST_CANON: "ledger says ratified but the claim is absent from canon — canon write lost; re-ratify if the payload is still queued, else re-observe"
+  info:
+    ORPHAN_CANON: "canon claim with no ratifying ledger record — expected for a direct `capture`/`import-canonical`, which bypass the queue; listed only with --verbose"
+  reconciled_marker: "ledger records written by recover carry reconciled:true so the repair itself is auditable (Axiom 11: no silent state changes)"
+
+# ---------------------------------------------------------------------------
 # View generation
 # ---------------------------------------------------------------------------
 view:

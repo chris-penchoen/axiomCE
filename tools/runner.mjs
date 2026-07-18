@@ -1139,6 +1139,181 @@ export function applyRatify(root = ROOT, plan, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// recover (state reconciliation): detect + repair an inconsistent runtime store
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect inconsistencies between the three runtime state layers — the ledger
+ * (append-only status log, latest-per-obs_id), the ratification queue (pending
+ * claims), and canon (ratified claims). Pure/read-only. These states arise from
+ * interrupted writes (a crash between two appends), manual edits, or partial
+ * restores across machines. Each finding carries a severity:
+ *   repairable  a deterministic, provenance-preserving fix exists (applyRecover)
+ *   manual      real data loss — a human must re-observe/re-ratify; NEVER auto
+ *   info        benign + expected (e.g. a direct `capture` bypasses the ledger)
+ * @returns {{ findings: object[] }}
+ */
+export function planRecover(root = ROOT) {
+  const findings = [];
+  const ledgerLatest = loadLedger(root);                 // obs_id -> latest entry
+  const canon = loadClaims(root);
+  const canonIds = new Set(canon.map((c) => c.id));
+
+  // obs_id -> partition (first queue it appears in) + the queue entry itself.
+  const obsPartition = new Map();
+  const queueEntryByObs = new Map();
+  const obsCount = new Map();
+  for (const isPrivate of [false, true]) {
+    for (const q of readJsonl(runtimePaths(root, isPrivate).queue)) {
+      if (!q || !q.obs_id) continue;
+      obsCount.set(q.obs_id, (obsCount.get(q.obs_id) || 0) + 1);
+      if (!obsPartition.has(q.obs_id)) obsPartition.set(q.obs_id, isPrivate);
+      if (!queueEntryByObs.has(q.obs_id)) queueEntryByObs.set(q.obs_id, q);
+    }
+  }
+  const ratifiedClaimIds = new Set();
+  for (const e of ledgerLatest.values())
+    if (e.status === "ratified" && e.claim_id) ratifiedClaimIds.add(e.claim_id);
+
+  // 1. duplicate obs_ids in the queue (idempotency breach — same content twice).
+  for (const [obs, n] of obsCount) {
+    if (n > 1) findings.push({ type: "DUPLICATE_OBS_IN_QUEUE", severity: "repairable", obs_id: obs,
+      detail: `${n} queue entries share obs_id ${obs}`, repair: "keep the first, drop the duplicates" });
+  }
+  // 2. stale queue entry: ledger already ratified/discarded but still queued
+  //    (crash after the ledger append, before the queue removal).
+  for (const obs of queueEntryByObs.keys()) {
+    const led = ledgerLatest.get(obs);
+    if (led && (led.status === "ratified" || led.status === "discarded"))
+      findings.push({ type: "STALE_QUEUE_ENTRY", severity: "repairable", obs_id: obs,
+        detail: `queue holds obs_id ${obs} but ledger status is '${led.status}'`,
+        repair: "remove the completed entry from the queue" });
+  }
+  // 3. queue entry with no ledger record at all (enqueue half-committed).
+  for (const obs of queueEntryByObs.keys()) {
+    if (!ledgerLatest.has(obs))
+      findings.push({ type: "UNTRACKED_QUEUE", severity: "repairable", obs_id: obs,
+        detail: `queue holds obs_id ${obs} with no ledger record`,
+        repair: "append a 'queued' ledger record to match the queue" });
+  }
+  // 4. ledger says queued: reconcile forward if canon already has it, else it is
+  //    a lost pending payload (ledger only stores ids, not the claim body).
+  for (const [obs, e] of ledgerLatest) {
+    if (e.status !== "queued") continue;
+    if (e.claim_id && canonIds.has(e.claim_id))
+      findings.push({ type: "LEDGER_BEHIND_CANON", severity: "repairable", obs_id: obs, claim_id: e.claim_id,
+        detail: `ledger says ${obs} is queued but claim ${e.claim_id} is already in canon`,
+        repair: "append a 'ratified' ledger record to match canon" });
+    else if (!queueEntryByObs.has(obs))
+      findings.push({ type: "LOST_QUEUED", severity: "manual", obs_id: obs, claim_id: e.claim_id || null,
+        detail: `ledger says ${obs} is queued but it is absent from both queue and canon — the pending payload is lost; re-observe the source`,
+        repair: null });
+  }
+  // 5. ledger says ratified but the claim is missing from canon (canon write
+  //    lost). Recoverable only if the payload still sits in the queue.
+  for (const [obs, e] of ledgerLatest) {
+    if (e.status === "ratified" && e.claim_id && !canonIds.has(e.claim_id)) {
+      const inQueue = queueEntryByObs.has(obs);
+      findings.push({ type: "LOST_CANON", severity: "manual", obs_id: obs, claim_id: e.claim_id,
+        detail: inQueue
+          ? `ledger says ${e.claim_id} was ratified but it is not in canon — payload still in queue; run \`ratify --id ${obs} --apply\` to complete it`
+          : `ledger says ${e.claim_id} was ratified but it is not in canon and the payload is gone — re-observe the source`,
+        repair: null });
+    }
+  }
+  // 6. canon claim with no ratifying ledger record. Benign + expected for claims
+  //    written directly via `capture`/`import-canonical`, which bypass the queue.
+  for (const c of canon) {
+    if (!ratifiedClaimIds.has(c.id))
+      findings.push({ type: "ORPHAN_CANON", severity: "info", claim_id: c.id,
+        detail: `canon claim ${c.id} has no 'ratified' ledger record (expected for a direct capture)`,
+        repair: null });
+  }
+  return { findings };
+}
+
+/**
+ * Apply ONLY the deterministic, provenance-preserving repairs from a recover
+ * plan, under the writer lock. Repairs are append-only on the ledger and
+ * removal-only on the queue — canon is never touched, and no ratification event
+ * is fabricated for a claim that was not actually in canon. Reconciling ledger
+ * records are marked `reconciled: true` so the repair is itself auditable.
+ * Recompute the plan INSIDE the lock (pass a fresh planRecover) to avoid acting
+ * on a stale view. `manual`/`info` findings are ignored here by design.
+ * @returns {{ applied: object[] }}
+ */
+export function applyRecover(root = ROOT, plan, opts = {}) {
+  const now = opts.now || new Date().toISOString();
+  const canonById = new Map(loadClaims(root).map((c) => [c.id, c]));
+
+  const removeObs = { false: new Set(), true: new Set() };
+  const dedupObs = new Set();
+  const ledgerAppend = { false: [], true: [] };
+
+  // Locate each obs_id's partition + queue entry (fresh read under the lock).
+  const obsPartition = new Map();
+  const queueEntryByObs = new Map();
+  for (const isPrivate of [false, true]) {
+    for (const q of readJsonl(runtimePaths(root, isPrivate).queue)) {
+      if (!q || !q.obs_id) continue;
+      if (!obsPartition.has(q.obs_id)) obsPartition.set(q.obs_id, isPrivate);
+      if (!queueEntryByObs.has(q.obs_id)) queueEntryByObs.set(q.obs_id, q);
+    }
+  }
+
+  const applied = [];
+  for (const f of plan.findings) {
+    if (f.type === "STALE_QUEUE_ENTRY") {
+      const p = obsPartition.get(f.obs_id);
+      if (p === undefined) continue;
+      removeObs[String(p)].add(f.obs_id);
+      applied.push(f);
+    } else if (f.type === "DUPLICATE_OBS_IN_QUEUE") {
+      dedupObs.add(f.obs_id);
+      applied.push(f);
+    } else if (f.type === "UNTRACKED_QUEUE") {
+      const p = obsPartition.get(f.obs_id);
+      const entry = queueEntryByObs.get(f.obs_id);
+      if (p === undefined || !entry) continue;
+      ledgerAppend[String(p)].push({ obs_id: f.obs_id, claim_id: entry.claim?.id ?? null, status: "queued", first_seen: now, reconciled: true });
+      applied.push(f);
+    } else if (f.type === "LEDGER_BEHIND_CANON") {
+      const c = canonById.get(f.claim_id);
+      if (!c) continue; // canon changed since planning — skip, re-plan will catch it
+      const isPrivate = !PUBLIC_CLASSES.has(c.classification);
+      ledgerAppend[String(isPrivate)].push({ obs_id: f.obs_id, claim_id: f.claim_id, status: "ratified", ratified_at: now, reconciled: true });
+      applied.push(f);
+    }
+    // LOST_QUEUED / LOST_CANON / ORPHAN_CANON: never auto-repaired.
+  }
+
+  // Rewrite queues (removal-only): drop stale entries + collapse duplicates.
+  for (const isPrivate of [false, true]) {
+    const key = String(isPrivate);
+    const qp = runtimePaths(root, isPrivate).queue;
+    if (!fs.existsSync(qp)) continue;
+    const before = readJsonl(qp);
+    const seen = new Set();
+    const after = [];
+    for (const q of before) {
+      if (removeObs[key].has(q.obs_id)) continue;
+      if (dedupObs.has(q.obs_id)) {
+        if (seen.has(q.obs_id)) continue;
+        seen.add(q.obs_id);
+      }
+      after.push(q);
+    }
+    if (after.length !== before.length) writeJsonl(qp, after);
+  }
+
+  // Append reconciling ledger records (routed by privacy).
+  appendJsonl(runtimePaths(root, false).ledger, ledgerAppend["false"]);
+  appendJsonl(runtimePaths(root, true).ledger, ledgerAppend["true"]);
+
+  return { applied };
+}
+
+// ---------------------------------------------------------------------------
 // triage (queue surfacing): sort the pending ratification queue into buckets
 // ---------------------------------------------------------------------------
 
@@ -1456,7 +1631,7 @@ export function applyRetract(root = ROOT, plan, opts = {}) {
 function parseArgs(argv) {
   const out = { _: [], entity: [], adapter: null, includePrivate: false, apply: false, out: null,
                 watch: false, ids: [], all: false, discard: false, trust: false, reason: null,
-                autoReady: false, ceiling: null, ratio: null };
+                autoReady: false, ceiling: null, ratio: null, verbose: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--entity") out.entity.push(argv[++i]);
@@ -1465,6 +1640,7 @@ function parseArgs(argv) {
     else if (a === "--apply") out.apply = true;
     else if (a === "--trust") out.trust = true;
     else if (a === "--watch") out.watch = true;
+    else if (a === "--verbose") out.verbose = true;
     else if (a === "--id") out.ids.push(argv[++i]);
     else if (a === "--all") out.all = true;
     else if (a === "--discard") out.discard = true;
@@ -1648,6 +1824,42 @@ function queueLabel(q) {
   return `${q.claim.id} (${q.claim.confidence}, ${q.claim.classification}) -> ${q.target}`;
 }
 
+function runRecover(opts) {
+  const plan = planRecover(ROOT);
+  const findings = plan.findings;
+  const repairable = findings.filter((f) => f.severity === "repairable");
+  const manual = findings.filter((f) => f.severity === "manual");
+  const info = findings.filter((f) => f.severity === "info");
+
+  if (findings.length === 0) {
+    console.log("recover: runtime store is consistent — no findings.");
+    process.exit(0);
+  }
+  console.log(`recover: ${findings.length} finding(s) — ${repairable.length} auto-repairable, ${manual.length} need a human, ${info.length} info.`);
+  console.log("");
+  for (const f of repairable) console.log(`  [repairable] ${f.type} ${f.obs_id || f.claim_id || ""}\n      ${f.detail}\n      fix: ${f.repair}`);
+  for (const f of manual) console.log(`  [MANUAL]     ${f.type} ${f.obs_id || f.claim_id || ""}\n      ${f.detail}`);
+  if (info.length) {
+    if (opts.verbose) for (const f of info) console.log(`  [info]       ${f.type} ${f.claim_id || f.obs_id || ""}: ${f.detail}`);
+    else console.log(`  [info]       ${info.length} canon claim(s) with no ratifying ledger record (direct captures). Use --verbose to list.`);
+  }
+  console.log("");
+
+  if (!opts.apply) {
+    if (repairable.length) console.log("Re-run with --apply to perform the auto-repairs (append-only ledger reconciliation + stale/duplicate queue cleanup). Manual/info findings are never auto-changed.");
+    process.exit(manual.length ? 1 : 0);
+  }
+  if (repairable.length === 0) {
+    console.log("Nothing auto-repairable.");
+    process.exit(manual.length ? 1 : 0);
+  }
+  // Re-plan INSIDE the lock so we act on the current state, not the stale view.
+  const { applied } = withWriterLock(ROOT, () => applyRecover(ROOT, planRecover(ROOT)));
+  console.log(`recover: applied ${applied.length} repair(s).`);
+  if (manual.length) console.log(`${manual.length} finding(s) still need a human (see above).`);
+  process.exit(manual.length ? 1 : 0);
+}
+
 function runSchema(opts) {
   const declared = readSchemaVersion(ROOT);
   console.log(`schema: engine v${RUNTIME_SCHEMA_VERSION}; store declares v${declared} (${schemaVersionPath(ROOT).replace(ROOT + path.sep, "")}).`);
@@ -1771,6 +1983,7 @@ if (isMain) {
   else if (cmd === "triage") runTriage(opts);
   else if (cmd === "dead-letter") runDeadLetter(opts);
   else if (cmd === "schema") runSchema(opts);
+  else if (cmd === "recover") runRecover(opts);
   else if (cmd === "auto-ratify") runAutoRatify(opts);
   else {
     console.error([
@@ -1783,6 +1996,7 @@ if (isMain) {
       "  runner.mjs triage                                   # sort the pending queue into buckets (where you're needed)",
       "  runner.mjs dead-letter                              # list quarantined candidates that failed the sync gates (rt-dead-letter)",
       "  runner.mjs schema [--apply]                         # show runtime schema version; --apply migrates a behind store now (rt-schema-versioning)",
+      "  runner.mjs recover [--apply] [--verbose]            # detect (and --apply repair) inconsistent ledger/queue/canon state (rt-recovery-reconcile)",
       "  runner.mjs auto-ratify [--auto-ready] [--ceiling <class>] [--ratio <n>] [--apply]  # delegated ratification (Axiom 18; default: fully manual)",
     ].join("\n"));
     process.exit(1);
