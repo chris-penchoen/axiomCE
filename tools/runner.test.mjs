@@ -22,6 +22,14 @@ import {
   applySync,
   planRatify,
   applyRatify,
+  triageBucket,
+  triageQueue,
+  TRIAGE_BUCKETS,
+  classAtOrBelow,
+  DEFAULT_RATIFY_POLICY,
+  decisiveResolution,
+  planAutoRatify,
+  applyAutoRatify,
 } from "./runner.mjs";
 
 function tmpDir() {
@@ -490,5 +498,160 @@ test("loadQueue/loadLedger throw loudly on a corrupt operational line (never sil
   const qp = path.join(dir, "runtime", "ratification-queue.jsonl");
   fs.appendFileSync(qp, "{ this is not valid json\n");
   assert.throws(() => loadQueue(dir), /corrupt operational JSONL/);
+});
+
+// --- triage (queue surfacing / bucketing) ---
+const RECENT_TS = "2026-07-13T00:00:00Z"; // 1d before runner-test TODAY (2026-07-14)
+
+function qentry(claim, over = {}) {
+  return {
+    obs_id: "obs-" + claim.id,
+    claim,
+    target: PRIVATE_CLASSES_TEST.has(claim.classification)
+      ? path.join("private", "claims", claim.entity.replace(/:/g, "-") + ".jsonl")
+      : path.join("claims", claim.entity.replace(/:/g, "-") + ".jsonl"),
+    private: PRIVATE_CLASSES_TEST.has(claim.classification),
+    source_file: "obs.jsonl", line: 1, queued_at: RECENT_TS,
+    ...over,
+  };
+}
+const PRIVATE_CLASSES_TEST = new Set(["restricted", "sensitive"]);
+function enqueue(dir, entries) {
+  const pub = entries.filter((e) => !e.private);
+  const prv = entries.filter((e) => e.private);
+  if (pub.length) write(dir, path.join("runtime", "ratification-queue.jsonl"), pub.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  if (prv.length) write(dir, path.join("private", "runtime", "ratification-queue.jsonl"), prv.map((e) => JSON.stringify(e)).join("\n") + "\n");
+}
+
+test("triageBucket: restricted/sensitive -> privacy-hold (even if unresolved or conflicting)", () => {
+  assert.equal(triageBucket(claim({ classification: "restricted", confidence: "unresolved" }), [], TODAY), "privacy-hold");
+  assert.equal(triageBucket(claim({ classification: "sensitive" }), [], TODAY), "privacy-hold");
+});
+
+test("triageBucket: unresolved (non-private) -> needs-clarification, outranking a contradiction", () => {
+  const canon = [claim({ id: "clm-fix-0001", value: "blue", asserted_at: RECENT_TS })];
+  const q = claim({ id: "clm-fix-0002", value: "green", confidence: "unresolved", asserted_at: RECENT_TS });
+  assert.equal(triageBucket(q, canon, TODAY), "needs-clarification");
+});
+
+test("triageBucket: would-conflict-with-canon -> contradiction", () => {
+  const canon = [claim({ id: "clm-fix-0001", value: "blue", asserted_at: RECENT_TS })];
+  const q = claim({ id: "clm-fix-0002", value: "green", asserted_at: RECENT_TS });
+  assert.equal(triageBucket(q, canon, TODAY), "contradiction");
+});
+
+test("triageBucket: clean, no conflict -> ready", () => {
+  assert.equal(triageBucket(claim({ predicate: "year", value: "2019", asserted_at: RECENT_TS }), [], TODAY), "ready");
+});
+
+test("triageQueue sorts the pending queue into all four buckets", () => {
+  const dir = tmpDir();
+  seedStore(dir); // canon: organization:fix color=blue (confirmed)
+  write(dir, "private/entities/sedan.md", entityFile("vehicle:sedan-01", "restricted"));
+  enqueue(dir, [
+    qentry(claim({ id: "clm-fix-0010", predicate: "year", value: "2019", asserted_at: RECENT_TS })),        // ready
+    qentry(claim({ id: "clm-fix-0011", predicate: "color", value: "green", asserted_at: RECENT_TS })),       // contradiction (vs canon blue)
+    qentry(claim({ id: "clm-fix-0012", predicate: "status", value: "unknown", confidence: "unresolved", asserted_at: RECENT_TS })), // needs-clarification
+    qentry(claim({ id: "clm-fix-0013", entity: "vehicle:sedan-01", predicate: "vin", value: "x", classification: "restricted", asserted_at: RECENT_TS })), // privacy-hold
+  ]);
+  const b = triageQueue(dir, { today: TODAY });
+  assert.equal(b.ready.length, 1);
+  assert.equal(b.contradiction.length, 1);
+  assert.equal(b["needs-clarification"].length, 1);
+  assert.equal(b["privacy-hold"].length, 1);
+  assert.deepEqual(TRIAGE_BUCKETS, ["privacy-hold", "needs-clarification", "contradiction", "ready"]);
+});
+
+// --- delegated ratification (Axiom 18) ---
+test("classAtOrBelow respects the public<personal<sensitive<restricted scale; unknown fails closed", () => {
+  assert.equal(classAtOrBelow("public", "personal"), true);
+  assert.equal(classAtOrBelow("personal", "personal"), true);
+  assert.equal(classAtOrBelow("restricted", "public"), false);
+  assert.equal(classAtOrBelow("bogus", "public"), false);
+});
+
+test("DEFAULT_RATIFY_POLICY is the safe floor: zero automation", () => {
+  assert.equal(DEFAULT_RATIFY_POLICY.autoRatifyReady, false);
+  const dir = tmpDir();
+  seedStore(dir);
+  enqueue(dir, [qentry(claim({ id: "clm-fix-0010", predicate: "year", value: "2019", asserted_at: RECENT_TS }))]);
+  const plan = planAutoRatify(dir, { today: TODAY, now: RECENT_TS });
+  assert.equal(plan.autoRatify.length, 0);        // nothing auto-promoted by default
+  assert.equal(plan.surfaced.length, 1);          // everything surfaced for the human
+  assert.equal(plan.surfaced[0].bucket, "ready");
+});
+
+test("planAutoRatify auto-promotes the ready bucket only when policy enables it and class is at/below the ceiling", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  enqueue(dir, [
+    qentry(claim({ id: "clm-fix-0010", predicate: "year", value: "2019", classification: "public", asserted_at: RECENT_TS })),
+    qentry(claim({ id: "clm-fix-0011", predicate: "trim", value: "LX", classification: "personal", asserted_at: RECENT_TS })),
+  ]);
+  const plan = planAutoRatify(dir, { today: TODAY, now: RECENT_TS, policy: { autoRatifyReady: true, classificationCeiling: "public" } });
+  assert.deepEqual(plan.autoRatify.map((q) => q.claim.id), ["clm-fix-0010"]); // public promoted
+  assert.ok(plan.surfaced.some((s) => s.entry.claim.id === "clm-fix-0011"));  // personal above ceiling -> surfaced
+});
+
+test("planAutoRatify HARD-excludes privacy-hold and needs-clarification even under an aggressive policy", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  write(dir, "private/entities/sedan.md", entityFile("vehicle:sedan-01", "restricted"));
+  enqueue(dir, [
+    qentry(claim({ id: "clm-fix-0012", predicate: "status", value: "unknown", confidence: "unresolved", asserted_at: RECENT_TS })),
+    qentry(claim({ id: "clm-fix-0013", entity: "vehicle:sedan-01", predicate: "vin", value: "x", classification: "restricted", asserted_at: RECENT_TS })),
+  ]);
+  const plan = planAutoRatify(dir, { today: TODAY, now: RECENT_TS, policy: { autoRatifyReady: true, classificationCeiling: "restricted" } });
+  assert.equal(plan.autoRatify.length, 0); // neither is auto-ratified
+  const buckets = plan.surfaced.map((s) => s.bucket).sort();
+  assert.deepEqual(buckets, ["needs-clarification", "privacy-hold"]);
+});
+
+test("decisiveResolution flags a >=N:1 distinct-source win and abstains otherwise", () => {
+  const green = ["s1", "s2", "s3"].map((s, i) => claim({ id: "g" + i, value: "green", source: s }));
+  const blue = [claim({ id: "b0", value: "blue", source: "s9" })];
+  const d = decisiveResolution([...green, ...blue], 3);
+  assert.equal(d.decisive, true);
+  assert.equal(d.winningValue, "green");
+  const d2 = decisiveResolution([claim({ id: "g", value: "green", source: "s1" }), claim({ id: "g2", value: "green", source: "s2" }), ...blue], 3);
+  assert.equal(d2.decisive, false); // 2:1 does not meet 3:1
+});
+
+test("decisiveResolution abstains when there is only one distinct value (agreement, not conflict)", () => {
+  const d = decisiveResolution([claim({ id: "a", value: "green", source: "s1" }), claim({ id: "b", value: "green", source: "s2" })], 3);
+  assert.equal(d.decisive, false);
+  assert.match(d.reason, /one distinct value/);
+});
+
+test("planAutoRatify surfaces an evidence-decisive contradiction as ADVISORY (resolvable), never auto-written", () => {
+  const dir = tmpDir();
+  // Canon already holds 3 independently-sourced 'green' claims on the predicate.
+  write(dir, "entities/fix.md", entityFile("organization:fix", "public", "Fix Co"));
+  write(dir, "claims/organization-fix.jsonl",
+    ["s1", "s2", "s3"].map((s, i) => JSON.stringify(claim({ id: "clm-fix-000" + (i + 1), predicate: "hue", value: "green", source: s, asserted_at: RECENT_TS }))).join("\n") + "\n");
+  // A lone 'blue' claim is queued -> contradiction, but evidence is 3:1 for green.
+  enqueue(dir, [qentry(claim({ id: "clm-fix-0020", predicate: "hue", value: "blue", source: "s9", asserted_at: RECENT_TS }))]);
+  const plan = planAutoRatify(dir, { today: TODAY, now: RECENT_TS, policy: { decisiveSourceRatio: 3 } });
+  assert.equal(plan.resolvable.length, 1);
+  assert.equal(plan.resolvable[0].decision.winningValue, "green");
+  assert.equal(plan.autoRatify.length, 0);          // NOT auto-written
+  const canonAfter = fs.readFileSync(path.join(dir, "claims", "organization-fix.jsonl"), "utf8");
+  assert.equal(canonAfter.split("clm-fix-0020").length - 1, 0); // queued claim never entered canon
+});
+
+test("applyAutoRatify promotes only the ready autoRatify set into canon and writes an audit log", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  enqueue(dir, [qentry(claim({ id: "clm-fix-0010", predicate: "year", value: "2019", classification: "public", asserted_at: RECENT_TS }))]);
+  const plan = planAutoRatify(dir, { today: TODAY, now: RECENT_TS, policy: { autoRatifyReady: true, classificationCeiling: "public" } });
+  const res = applyAutoRatify(dir, plan);
+  assert.equal(res.appended.length, 1);
+  assert.equal(loadQueue(dir).length, 0); // promoted item cleared from queue
+  const canon = fs.readFileSync(path.join(dir, "claims", "organization-fix.jsonl"), "utf8");
+  assert.ok(canon.includes("clm-fix-0010"));
+  const auditPath = path.join(dir, "runtime", "delegated-audit.jsonl");
+  assert.ok(fs.existsSync(auditPath));
+  const audit = fs.readFileSync(auditPath, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+  assert.ok(audit.some((a) => a.claim_id === "clm-fix-0010" && a.action === "auto-ratify"));
 });
 

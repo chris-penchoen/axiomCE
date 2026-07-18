@@ -86,6 +86,42 @@ policy:
   # tools/generate-views.mjs (or pass classify(..,{dormancyDays})) to change it.
   dormancy_days: 90
 
+  # Axiom 18 — delegated ratification. A human-authored policy MAY let the runner
+  # auto-promote the clean/"ready" bucket and surface evidence-decisive
+  # contradictions. DEFAULTS ARE THE SAFE FLOOR: zero automation — everything is
+  # surfaced for human ratification (sampling starts at 100% surfaced; the human
+  # ramps automation UP). Policy is human-authored, never model-self-certified;
+  # every delegated decision is audited (runtime/delegated-audit.jsonl) and
+  # reversible (Axiom 24). Edit DEFAULT_RATIFY_POLICY in tools/runner.mjs or pass
+  # `auto-ratify --auto-ready --ceiling <class> --ratio <n>`.
+  delegated_ratification:
+    auto_ratify_ready: false        # (a) auto-promote clean bucket? default off
+    classification_ceiling: public  # ...only at/below this sensitivity
+    decisive_source_ratio: 3        # (b) distinct-source ratio bar (ax10 weight)
+    # LIMITATION (honest): the ratified decisive-evidence bar also requires "the
+    # losing side has no higher provenance-TIER confirming source" and an
+    # "authoritative source" disconfirmation branch. The claim schema models
+    # provenance as a single `source` STRING with NO tier, so those clauses are
+    # UNCOMPUTABLE. Contradiction auto-RESOLVE is therefore ADVISORY only: the
+    # runner surfaces "meets N:1 ratio" for one-step human confirmation and does
+    # NOT auto-write a contradiction resolution to canon. Full auto-resolve is
+    # blocked on adding a provenance-tier field (a schema change needing
+    # ratification).
+
+# ---------------------------------------------------------------------------
+# Queue triage (surfacing the pending ratification queue)
+# ---------------------------------------------------------------------------
+triage:
+  # `runner.mjs triage` sorts the pending ratification queue into buckets, in
+  # priority order. Each queued claim lands in exactly one bucket. It is a
+  # categorizer, NOT a gate — nothing is blocked, only surfaced.
+  buckets: [privacy-hold, needs-clarification, contradiction, ready]
+  privacy_hold: "classification restricted/sensitive — you decide; never automated"
+  needs_clarification: "confidence unresolved — a human must clarify"
+  contradiction: "promoting would create/join a live contradiction against canon"
+  ready: "clean: settled confidence, public/personal, no conflict"
+  hard_excluded_from_automation: [privacy-hold, needs-clarification]
+
 # ---------------------------------------------------------------------------
 # View generation
 # ---------------------------------------------------------------------------

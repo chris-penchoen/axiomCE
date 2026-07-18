@@ -67,6 +67,9 @@ function runtimePaths(root = ROOT, isPrivate = false) {
     // Tracked run manifests carry public ids/counts only; private detail goes
     // to private/runtime/runs (git-excluded), routed by `isPrivate`.
     runs: path.join(base, "runs"),
+    // Append-only audit of delegated (policy-driven) ratification decisions
+    // (Axiom 18 guardrail #2). Routed public/private like everything else.
+    audit: path.join(base, "delegated-audit.jsonl"),
   };
 }
 
@@ -946,12 +949,226 @@ export function applyRatify(root = ROOT, plan, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// triage (queue surfacing): sort the pending ratification queue into buckets
+// ---------------------------------------------------------------------------
+
+// Buckets in PRIORITY order (most safety-constraining first). Each queued item
+// lands in exactly one bucket. `privacy-hold` and `needs-clarification` are the
+// classes HARD-excluded from any delegated automation (Axiom 18 guardrail #4).
+export const TRIAGE_BUCKETS = ["privacy-hold", "needs-clarification", "contradiction", "ready"];
+
+/**
+ * Categorize a single queued claim against the entity's current canon claims.
+ * Deterministic; a categorizer, NOT a gate — nothing is blocked, only sorted
+ * (the safety-floor logic reused for surfacing):
+ *   privacy-hold        classification restricted/sensitive (never auto-anything)
+ *   needs-clarification confidence === "unresolved" (a human must clarify)
+ *   contradiction       promoting would create/join a LIVE contradiction on the
+ *                       entity+predicate (real disagreement needing attention)
+ *   ready               clean: settled confidence, public/personal, no conflict
+ */
+export function triageBucket(claim, canonForEntity = [], today = TODAY) {
+  if (PRIVATE_CLASSES.has(claim.classification)) return "privacy-hold";
+  if (claim.confidence === "unresolved") return "needs-clarification";
+  const { contradictions } = classify([...canonForEntity, claim], today);
+  if (contradictions.has(claim.predicate)) return "contradiction";
+  return "ready";
+}
+
+/**
+ * Triage the whole pending queue (public + private) into buckets. Pure/
+ * deterministic: reads canon + queue, writes nothing. Realizes the "surface
+ * contradictions / where I'm needed" view.
+ */
+export function triageQueue(root = ROOT, opts = {}) {
+  const today = opts.today || TODAY;
+  const queue = loadQueue(root);
+  const canon = loadClaims(root);
+  const byEntity = new Map();
+  for (const c of canon) {
+    if (!byEntity.has(c.entity)) byEntity.set(c.entity, []);
+    byEntity.get(c.entity).push(c);
+  }
+  const buckets = {};
+  for (const b of TRIAGE_BUCKETS) buckets[b] = [];
+  for (const q of queue) {
+    const bucket = triageBucket(q.claim, byEntity.get(q.claim.entity) || [], today);
+    buckets[bucket].push(q);
+  }
+  return buckets;
+}
+
+// ---------------------------------------------------------------------------
+// delegated ratification (Axiom 18): human-authored policy MAY auto-promote the
+// clean bucket and surface decisively-resolvable contradictions. The DEFAULT
+// policy is the SAFE FLOOR — ZERO automation: every item is surfaced for human
+// ratification ("sampling starts at 100% surfaced; the human ramps automation
+// UP over time"). Policy is human-authored, never model-self-certified.
+// Reversible (Axiom 24); every decision is audited (guardrail #2).
+// ---------------------------------------------------------------------------
+
+// public < personal < sensitive < restricted (sensitivity ascending).
+const CLASSIFICATION_ORDER = ["public", "personal", "sensitive", "restricted"];
+
+/** True iff `cls` is at or below `ceiling` on the sensitivity scale. Unknown → false (fail-closed). */
+export function classAtOrBelow(cls, ceiling) {
+  const a = CLASSIFICATION_ORDER.indexOf(cls);
+  const b = CLASSIFICATION_ORDER.indexOf(ceiling);
+  return a !== -1 && b !== -1 && a <= b;
+}
+
+// The single human-authored policy knob-set. Defaults = do nothing automatically.
+export const DEFAULT_RATIFY_POLICY = {
+  autoRatifyReady: false,           // (a) auto-promote the clean/ready bucket?
+  classificationCeiling: "public",  // ...only at/below this classification
+  decisiveSourceRatio: 3,           // (b) distinct-source ratio bar (ax10 weight)
+};
+
+/**
+ * Decide whether a contradiction is DECISIVELY resolvable by evidence alone
+ * (Axiom 10 weight). Deterministic. Groups the contending claims by
+ * whitespace-normalized value, weights each by DISTINCT sources, and checks
+ * whether the top value dominates the runner-up by >= `ratio`.
+ *
+ * HONEST SCOPE: the ratified bar ALSO requires "the losing side has no higher
+ * provenance-TIER confirming source" and an "authoritative-source"
+ * disconfirmation branch. The claim schema models provenance as a single
+ * `source` STRING with NO tier, so those clauses are UNCOMPUTABLE. This checks
+ * the computable half (distinct-source ratio) only — it is therefore ADVISORY:
+ * it SURFACES "meets the N:1 ratio" for a human to confirm and does NOT
+ * auto-write a contradiction resolution to canon. Full auto-resolve is blocked
+ * on adding a provenance-tier field (a schema/canon change requiring
+ * ratification).
+ */
+export function decisiveResolution(claimList, ratio = 3) {
+  const norm = (v) => String(v ?? "").trim().replace(/\s+/g, " ");
+  const byValue = new Map(); // normalized value -> Set(source)
+  for (const c of claimList) {
+    const v = norm(c.value);
+    if (!byValue.has(v)) byValue.set(v, new Set());
+    byValue.get(v).add(c.source);
+  }
+  const ranked = [...byValue.entries()]
+    .map(([value, sources]) => ({ value, weight: sources.size }))
+    .sort((a, b) => b.weight - a.weight || (a.value < b.value ? -1 : 1));
+  if (ranked.length < 2) {
+    return { decisive: false, ratio, ranked, reason: "only one distinct value (agreement, not a genuine contradiction)" };
+  }
+  const [top, next] = ranked;
+  const decisive = top.weight > next.weight && top.weight >= ratio * next.weight;
+  return {
+    decisive,
+    ratio,
+    winningValue: decisive ? top.value : null,
+    topWeight: top.weight,
+    runnerUpWeight: next.weight,
+    ranked,
+    reason: decisive
+      ? `top value has ${top.weight} distinct sources vs ${next.weight} (>= ${ratio}:1)`
+      : `top ${top.weight} vs runner-up ${next.weight} does not meet ${ratio}:1`,
+  };
+}
+
+/**
+ * Plan delegated ratification under a human-authored policy. Pure/deterministic;
+ * writes nothing. Partitions the queue into:
+ *   autoRatify  ready-bucket items the policy will auto-promote (clean, at/below
+ *               the classification ceiling)
+ *   resolvable  contradiction-bucket items meeting the evidence-ratio bar —
+ *               SURFACED as "a human can confirm in one step" (advisory; NOT
+ *               auto-written this build, pending a provenance-tier field)
+ *   surfaced    everything else — needs a human (the default is EVERYTHING)
+ * Every item yields an audit record. privacy-hold + needs-clarification are hard
+ * excluded from autoRatify/resolvable by triage-bucket construction.
+ */
+export function planAutoRatify(root = ROOT, opts = {}) {
+  const policy = { ...DEFAULT_RATIFY_POLICY, ...(opts.policy || {}) };
+  const today = opts.today || TODAY;
+  const now = opts.now || new Date().toISOString();
+  const buckets = triageQueue(root, { today });
+  const canon = loadClaims(root);
+  const activeFor = (entity, predicate) =>
+    classify(canon.filter((c) => c.entity === entity), today).active
+      .filter((c) => c.predicate === predicate);
+
+  const autoRatify = [];
+  const resolvable = [];
+  const surfaced = [];
+  const audit = [];
+  const rec = (q, bucket, action, reason) =>
+    audit.push({ obs_id: q.obs_id, claim_id: q.claim.id, private: q.private, bucket, action, reason, decided_at: now });
+
+  for (const q of buckets.ready) {
+    const ok = policy.autoRatifyReady && classAtOrBelow(q.claim.classification, policy.classificationCeiling);
+    if (ok) {
+      autoRatify.push(q);
+      rec(q, "ready", "auto-ratify", `clean; classification ${q.claim.classification} <= ceiling ${policy.classificationCeiling}`);
+    } else {
+      const why = !policy.autoRatifyReady
+        ? "auto-ratify disabled (surfaced for human)"
+        : `classification ${q.claim.classification} above ceiling ${policy.classificationCeiling}`;
+      surfaced.push({ entry: q, bucket: "ready", why });
+      rec(q, "ready", "surface", why);
+    }
+  }
+
+  for (const q of buckets.contradiction) {
+    const contending = [...activeFor(q.claim.entity, q.claim.predicate), q.claim];
+    const decision = decisiveResolution(contending, policy.decisiveSourceRatio);
+    if (decision.decisive) {
+      resolvable.push({ entry: q, decision });
+      rec(q, "contradiction", "surface-resolvable",
+        `evidence-decisive (${decision.reason}); human confirmation required (auto-write deferred: no provenance tier)`);
+    } else {
+      surfaced.push({ entry: q, bucket: "contradiction", why: decision.reason });
+      rec(q, "contradiction", "surface", decision.reason);
+    }
+  }
+
+  for (const q of buckets["privacy-hold"]) {
+    surfaced.push({ entry: q, bucket: "privacy-hold", why: "privacy-hold: hard-excluded from automation" });
+    rec(q, "privacy-hold", "surface", "hard-excluded from automation");
+  }
+  for (const q of buckets["needs-clarification"]) {
+    surfaced.push({ entry: q, bucket: "needs-clarification", why: "unresolved: hard-excluded from automation" });
+    rec(q, "needs-clarification", "surface", "hard-excluded from automation");
+  }
+
+  return { autoRatify, resolvable, surfaced, audit, buckets, policy };
+}
+
+/** Append delegated-ratification audit entries, routed public/private (guardrail #2). */
+function writeAuditLog(root, audit) {
+  const pub = audit.filter((a) => !a.private);
+  const prv = audit.filter((a) => a.private);
+  if (pub.length) appendJsonl(runtimePaths(root, false).audit, pub);
+  if (prv.length) appendJsonl(runtimePaths(root, true).audit, prv);
+  return audit.length;
+}
+
+/**
+ * Apply a delegated-ratification plan: promote the policy-approved `autoRatify`
+ * (ready) items into canon by REUSING the human ratify path (applyRatify), and
+ * append the audit log. `resolvable` contradictions are advisory and are NOT
+ * written — they await human confirmation. Reversible (Axiom 24) via the same
+ * retract/supersede paths as any ratified claim.
+ */
+export function applyAutoRatify(root = ROOT, plan) {
+  const audited = writeAuditLog(root, plan.audit);
+  if (plan.autoRatify.length === 0) return { appended: [], discarded: 0, alreadyCanon: 0, audited };
+  const promote = plan.autoRatify.map((q) => ({ queueEntry: q, target: q.target, claim: q.claim, private: q.private }));
+  const res = applyRatify(root, { promote }, {});
+  return { ...res, audited };
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
   const out = { _: [], entity: [], adapter: null, includePrivate: false, apply: false, out: null,
-                watch: false, ids: [], all: false, discard: false, trust: false };
+                watch: false, ids: [], all: false, discard: false, trust: false,
+                autoReady: false, ceiling: null, ratio: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--entity") out.entity.push(argv[++i]);
@@ -963,6 +1180,9 @@ function parseArgs(argv) {
     else if (a === "--id") out.ids.push(argv[++i]);
     else if (a === "--all") out.all = true;
     else if (a === "--discard") out.discard = true;
+    else if (a === "--auto-ready") out.autoReady = true;
+    else if (a === "--ceiling") out.ceiling = argv[++i];
+    else if (a === "--ratio") out.ratio = Number(argv[++i]);
     else if (a === "-o" || a === "--out") out.out = argv[++i];
     else out._.push(a);
   }
@@ -1098,6 +1318,83 @@ function runRatify(opts) {
   process.exit(0);
 }
 
+// Privacy-safe queue-item label for console output: id + confidence +
+// classification + target ONLY — never the claim VALUE (mirrors ratify dry-run).
+function queueLabel(q) {
+  return `${q.claim.id} (${q.claim.confidence}, ${q.claim.classification}) -> ${q.target}`;
+}
+
+function runTriage(opts) {
+  const buckets = triageQueue(ROOT, {});
+  const total = TRIAGE_BUCKETS.reduce((n, b) => n + buckets[b].length, 0);
+  if (total === 0) {
+    console.log("triage: ratification queue is empty — nothing pending.");
+    process.exit(0);
+  }
+  console.log(`triage: ${total} pending claim(s) in the ratification queue.\n`);
+  const legend = {
+    "privacy-hold": "PRIVACY-HOLD (restricted/sensitive — you decide; never automated)",
+    "needs-clarification": "NEEDS CLARIFICATION (unresolved — a human must clarify)",
+    "contradiction": "CONTRADICTION — would conflict with canon; your attention needed",
+    "ready": "READY (clean; no conflict; settled confidence)",
+  };
+  for (const b of TRIAGE_BUCKETS) {
+    const items = buckets[b];
+    console.log(`## ${legend[b]} — ${items.length}`);
+    for (const q of items) console.log(`  - ${queueLabel(q)}`);
+    console.log("");
+  }
+  process.exit(0);
+}
+
+function policyFromOpts(opts) {
+  const policy = { ...DEFAULT_RATIFY_POLICY };
+  if (opts.autoReady) policy.autoRatifyReady = true;
+  if (opts.ceiling) policy.classificationCeiling = opts.ceiling;
+  if (opts.ratio != null && Number.isFinite(opts.ratio)) policy.decisiveSourceRatio = opts.ratio;
+  return policy;
+}
+
+function runAutoRatify(opts) {
+  const policy = policyFromOpts(opts);
+  const plan = planAutoRatify(ROOT, { policy });
+  const total = plan.autoRatify.length + plan.resolvable.length + plan.surfaced.length;
+  if (total === 0) {
+    console.log("auto-ratify: ratification queue is empty — nothing pending.");
+    process.exit(0);
+  }
+  console.log(`auto-ratify: policy autoRatifyReady=${policy.autoRatifyReady}, ceiling=${policy.classificationCeiling}, ratio=${policy.decisiveSourceRatio}:1`);
+  console.log(`  ${plan.autoRatify.length} auto-ratify · ${plan.resolvable.length} evidence-decisive (surfaced) · ${plan.surfaced.length} surfaced for human\n`);
+
+  if (plan.resolvable.length) {
+    console.log("Evidence-decisive contradictions (ADVISORY — confirm with `ratify --id`; not auto-written):");
+    for (const r of plan.resolvable) console.log(`  - ${queueLabel(r.entry)}  [${r.decision.reason}]`);
+    console.log("");
+  }
+  if (plan.surfaced.length) {
+    console.log("Surfaced for human ratification:");
+    for (const s of plan.surfaced) console.log(`  - [${s.bucket}] ${queueLabel(s.entry)}  (${s.why})`);
+    console.log("");
+  }
+
+  if (plan.autoRatify.length === 0) {
+    console.log("auto-ratify: nothing eligible for auto-promotion under this policy (default is fully manual).");
+    writeAuditLog(ROOT, plan.audit);
+    process.exit(0);
+  }
+  if (!opts.apply) {
+    console.log(`auto-ratify (dry-run): would auto-promote ${plan.autoRatify.length} ready claim(s):`);
+    for (const q of plan.autoRatify) console.log(`  ${queueLabel(q)}`);
+    console.log("\nRe-run with --apply to auto-promote (audited; reversible).");
+    process.exit(0);
+  }
+  const res = withWriterLock(ROOT, () => applyAutoRatify(ROOT, plan));
+  for (const a of res.appended) console.log(`auto-ratified ${a.id} -> ${a.target}`);
+  generateAll(ROOT, { check: false });
+  console.log(`\nauto-ratify: ${res.appended.length} claim(s) promoted to canon (audited); views regenerated.`);
+  process.exit(0);
+}
+
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === import.meta.filename;
 if (isMain) {
   const [cmd, ...rest] = process.argv.slice(2);
@@ -1110,6 +1407,8 @@ if (isMain) {
   }
   else if (cmd === "sync") runSync(opts);
   else if (cmd === "ratify") runRatify(opts);
+  else if (cmd === "triage") runTriage(opts);
+  else if (cmd === "auto-ratify") runAutoRatify(opts);
   else {
     console.error([
       "Usage:",
@@ -1117,6 +1416,8 @@ if (isMain) {
       "  runner.mjs import-canonical <envelope.jsonl> --trust [--apply]   # PRIVILEGED: writes straight to canon, bypasses ratification",
       "  runner.mjs sync [--apply] [--watch]                 # observe inbox/observations/ -> ratification queue",
       "  runner.mjs ratify (--all | --id <id>...) [--discard] [--apply]   # promote queued claims into canon",
+      "  runner.mjs triage                                   # sort the pending queue into buckets (where you're needed)",
+      "  runner.mjs auto-ratify [--auto-ready] [--ceiling <class>] [--ratio <n>] [--apply]  # delegated ratification (Axiom 18; default: fully manual)",
     ].join("\n"));
     process.exit(1);
   }
