@@ -208,10 +208,107 @@ function withWriterLock(root, fn) {
     fs.closeSync(fd);
   }
   try {
+    // Guard every mutation: migrate the store forward to the engine's schema
+    // version, or refuse if it was written by a newer engine. Runs inside the
+    // lock so migration is serialized with all other writers.
+    ensureSchema(root);
     return fn();
   } finally {
     try { fs.rmSync(lockPath, { force: true }); } catch { /* best-effort release */ }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime schema versioning + migration scaffold (rt-schema-versioning)
+// ---------------------------------------------------------------------------
+
+// Bump when the on-disk shape of ANY operational runtime file (ledger, queue,
+// run manifest, delegated-audit, dead-letter) changes, and append a matching
+// entry to MIGRATIONS. A distributable store may be written by one engine
+// version and read by another across machines/time, so the store carries an
+// explicit version and mutations migrate-forward or refuse.
+export const RUNTIME_SCHEMA_VERSION = 1;
+
+/** Path to the runtime store's schema marker (public partition = the authority). */
+function schemaVersionPath(root = ROOT) {
+  return path.join(root, "runtime", "schema.json");
+}
+
+/** True if any operational runtime file already exists (store is in use). */
+function runtimeStoreExists(root = ROOT) {
+  for (const isPrivate of [false, true]) {
+    const rp = runtimePaths(root, isPrivate);
+    for (const f of [rp.ledger, rp.queue, rp.audit, rp.deadLetter]) {
+      if (fs.existsSync(f)) return true;
+    }
+    if (fs.existsSync(rp.runs) && fs.readdirSync(rp.runs).length) return true;
+  }
+  return false;
+}
+
+/**
+ * Read the runtime store's declared schema version.
+ *  - marker present            -> its schema_version
+ *  - marker absent, store empty -> RUNTIME_SCHEMA_VERSION (a fresh store is current)
+ *  - marker absent, store in use -> 0 (a legacy store written before versioning)
+ */
+export function readSchemaVersion(root = ROOT) {
+  const p = schemaVersionPath(root);
+  if (fs.existsSync(p)) {
+    try {
+      const v = JSON.parse(fs.readFileSync(p, "utf8")).schema_version;
+      if (Number.isInteger(v) && v >= 0) return v;
+    } catch { /* fall through */ }
+    return 0; // present but unreadable -> treat as legacy; migration re-stamps it
+  }
+  return runtimeStoreExists(root) ? 0 : RUNTIME_SCHEMA_VERSION;
+}
+
+// Ordered migrations. Each { from, to, migrate(root) } transforms the store in
+// place. v1 is the first versioned shape, so 0->1 only stamps the marker (the
+// pre-versioning shape is identical to v1). Future shape changes append
+// { from: 1, to: 2, migrate }, etc. — never renumber existing steps.
+export const MIGRATIONS = [
+  { from: 0, to: 1, migrate: (_root) => { /* pre-versioning shape == v1; no transform */ } },
+];
+
+function writeSchemaVersion(root, version, now) {
+  atomicWrite(
+    schemaVersionPath(root),
+    JSON.stringify({ schema_version: version, updated_at: now || new Date().toISOString() }, null, 2) + "\n"
+  );
+}
+
+/**
+ * Ensure the runtime store is at RUNTIME_SCHEMA_VERSION before any mutation.
+ * Migrates forward through MIGRATIONS when behind; REFUSES when the store was
+ * written by a NEWER engine (declared > current) so a distributable never
+ * silently corrupts a store it doesn't understand. Must run under the writer
+ * lock (it is invoked from withWriterLock). Deterministic; `opts.now` threads
+ * the marker timestamp for tests.
+ * @returns {{ from:number, to:number, migrated:boolean }}
+ */
+export function ensureSchema(root = ROOT, opts = {}) {
+  const declared = readSchemaVersion(root);
+  if (declared > RUNTIME_SCHEMA_VERSION) {
+    throw new Error(
+      `runtime store schema v${declared} is newer than this engine (v${RUNTIME_SCHEMA_VERSION}). ` +
+      `Upgrade tools/runner.mjs before writing — refusing to avoid corrupting a store written by a newer version.`
+    );
+  }
+  if (declared === RUNTIME_SCHEMA_VERSION) {
+    if (!fs.existsSync(schemaVersionPath(root))) writeSchemaVersion(root, RUNTIME_SCHEMA_VERSION, opts.now);
+    return { from: declared, to: declared, migrated: false };
+  }
+  let v = declared;
+  while (v < RUNTIME_SCHEMA_VERSION) {
+    const step = MIGRATIONS.find((m) => m.from === v);
+    if (!step) throw new Error(`no migration registered from runtime schema v${v} to v${v + 1}`);
+    step.migrate(root);
+    v = step.to;
+  }
+  writeSchemaVersion(root, RUNTIME_SCHEMA_VERSION, opts.now);
+  return { from: declared, to: RUNTIME_SCHEMA_VERSION, migrated: true };
 }
 
 /**
@@ -882,6 +979,7 @@ export function applySync(root = ROOT, plan, opts = {}) {
   const trackedManifest = {
     run: stamp,
     generator: "tools/runner.mjs sync",
+    schema_version: RUNTIME_SCHEMA_VERSION,
     queued: publicItems,                 // public only — never claim values
     private_queued_count: privateItems.length,
     duplicates: plan.duplicates.length,
@@ -895,6 +993,7 @@ export function applySync(root = ROOT, plan, opts = {}) {
     const privateManifest = {
       run: stamp,
       generator: "tools/runner.mjs sync",
+      schema_version: RUNTIME_SCHEMA_VERSION,
       observed_files: plan.files,        // filenames can reveal people/projects
       public_queued: publicItems,
       private_queued: privateItems,
@@ -1539,6 +1638,25 @@ function queueLabel(q) {
   return `${q.claim.id} (${q.claim.confidence}, ${q.claim.classification}) -> ${q.target}`;
 }
 
+function runSchema(opts) {
+  const declared = readSchemaVersion(ROOT);
+  console.log(`schema: engine v${RUNTIME_SCHEMA_VERSION}; store declares v${declared} (${schemaVersionPath(ROOT).replace(ROOT + path.sep, "")}).`);
+  if (declared > RUNTIME_SCHEMA_VERSION) {
+    console.error(`This store was written by a NEWER engine (v${declared}). Upgrade tools/runner.mjs — writes are refused until then.`);
+    process.exit(1);
+  }
+  if (declared === RUNTIME_SCHEMA_VERSION) {
+    console.log("Store is up to date.");
+    process.exit(0);
+  }
+  console.log(`Store is behind by ${RUNTIME_SCHEMA_VERSION - declared} version(s). It auto-migrates on the next write, or migrate now with --apply.`);
+  if (opts.apply) {
+    const res = withWriterLock(ROOT, () => ensureSchema(ROOT));
+    console.log(res.migrated ? `Migrated v${res.from} -> v${res.to}.` : "Nothing to migrate.");
+  }
+  process.exit(0);
+}
+
 function runDeadLetter(opts) {
   // Dead-letter records live PRIVATE-only. Print source/line + problem TYPE
   // messages (safe) but NEVER the raw candidate text (may hold the secret).
@@ -1642,6 +1760,7 @@ if (isMain) {
   else if (cmd === "retract") runRetract(opts);
   else if (cmd === "triage") runTriage(opts);
   else if (cmd === "dead-letter") runDeadLetter(opts);
+  else if (cmd === "schema") runSchema(opts);
   else if (cmd === "auto-ratify") runAutoRatify(opts);
   else {
     console.error([
@@ -1653,6 +1772,7 @@ if (isMain) {
       "  runner.mjs retract --id <claim_id>... --reason \"<why>\" [--apply]   # tombstone an active canonical claim (Axiom 24; audited, kept in history)",
       "  runner.mjs triage                                   # sort the pending queue into buckets (where you're needed)",
       "  runner.mjs dead-letter                              # list quarantined candidates that failed the sync gates (rt-dead-letter)",
+      "  runner.mjs schema [--apply]                         # show runtime schema version; --apply migrates a behind store now (rt-schema-versioning)",
       "  runner.mjs auto-ratify [--auto-ready] [--ceiling <class>] [--ratio <n>] [--apply]  # delegated ratification (Axiom 18; default: fully manual)",
     ].join("\n"));
     process.exit(1);

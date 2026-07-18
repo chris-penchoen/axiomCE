@@ -35,6 +35,10 @@ import {
   applyAutoRatify,
   planRetract,
   applyRetract,
+  RUNTIME_SCHEMA_VERSION,
+  readSchemaVersion,
+  ensureSchema,
+  MIGRATIONS,
 } from "./runner.mjs";
 
 function tmpDir() {
@@ -796,4 +800,41 @@ test("loadDeadLetter reflects written quarantine keys", () => {
   const keys = loadDeadLetter(dir);
   assert.equal(keys.size, 1);
   assert.ok(keys.has(plan.deadLetters[0].dl_key));
+});
+
+// --- runtime schema versioning (rt-schema-versioning) ---
+test("readSchemaVersion: fresh store is current; in-use store without a marker is legacy (0)", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  assert.equal(readSchemaVersion(dir), RUNTIME_SCHEMA_VERSION); // no runtime files yet
+  write(dir, "runtime/ledger.jsonl", JSON.stringify({ obs_id: "obs-x", status: "queued" }) + "\n");
+  assert.equal(readSchemaVersion(dir), 0);                      // in use, no marker -> legacy
+});
+
+test("ensureSchema stamps a fresh store and migrates a legacy store to current", () => {
+  const fresh = tmpDir();
+  seedStore(fresh);
+  const r1 = ensureSchema(fresh, { now: "2026-07-15T00:00:00Z" });
+  assert.deepEqual([r1.from, r1.to, r1.migrated], [RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION, false]);
+  assert.ok(fs.existsSync(path.join(fresh, "runtime", "schema.json")));
+
+  const legacy = tmpDir();
+  seedStore(legacy);
+  write(legacy, "runtime/ledger.jsonl", JSON.stringify({ obs_id: "obs-x", status: "queued" }) + "\n");
+  const r2 = ensureSchema(legacy, { now: "2026-07-15T00:00:00Z" });
+  assert.deepEqual([r2.from, r2.to, r2.migrated], [0, RUNTIME_SCHEMA_VERSION, true]);
+  assert.equal(readSchemaVersion(legacy), RUNTIME_SCHEMA_VERSION);
+});
+
+test("ensureSchema refuses a store written by a newer engine", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  write(dir, "runtime/schema.json", JSON.stringify({ schema_version: RUNTIME_SCHEMA_VERSION + 1 }) + "\n");
+  assert.throws(() => ensureSchema(dir), /newer than this engine/);
+});
+
+test("MIGRATIONS form a contiguous chain from 0 to the current version", () => {
+  let v = 0;
+  for (const m of MIGRATIONS) { assert.equal(m.from, v); v = m.to; }
+  assert.equal(v, RUNTIME_SCHEMA_VERSION);
 });

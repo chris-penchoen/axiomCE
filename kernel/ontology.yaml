@@ -138,6 +138,21 @@ dead_letter:
   record: "{ dl_key, source_file, line, problems[], raw, quarantined_at }"
 
 # ---------------------------------------------------------------------------
+# Runtime schema versioning (rt-schema-versioning)
+# ---------------------------------------------------------------------------
+schema_version:
+  # The on-disk runtime store carries an explicit version so a newer engine can
+  # migrate an older store forward, and an older engine REFUSES to write a store
+  # a newer engine created (rather than silently corrupting it).
+  current: 1
+  marker: "runtime/schema.json = { schema_version, updated_at } — public partition IS the authority for the store's version"
+  inference: "no marker + empty store -> treated as CURRENT (fresh); no marker + in-use store (ledger/queue/audit/dead-letter/runs present) -> treated as 0 (legacy, pre-versioning)"
+  enforcement: "ensureSchema runs inside the writer lock on every mutation: declared > current THROWS (refuse to corrupt); declared == current stamps the marker if missing; declared < current applies MIGRATIONS in order then stamps"
+  migrations: "MIGRATIONS is an ordered [{ from, to, migrate }] chain from 0 to current; v0->v1 is a no-op because v1 IS the pre-versioning shape"
+  inspect: "runner.mjs schema [--apply] — report engine vs store version; --apply migrates a behind store now under the lock"
+  manifest: "each run manifest records schema_version for traceability"
+
+# ---------------------------------------------------------------------------
 # View generation
 # ---------------------------------------------------------------------------
 view:
