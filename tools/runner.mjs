@@ -176,7 +176,7 @@ function isPidAlive(pid) {
  * ledger/queue/canon. Zero-dependency: an O_EXCL lockfile under runtime/.
  * Recovers a stale lock only when its owning PID is dead or it has aged out.
  */
-function withWriterLock(root, fn) {
+export function withWriterLock(root, fn) {
   const lockPath = path.join(root, "runtime", "writer.lock");
   const STALE_MS = 60_000;
   fs.mkdirSync(path.dirname(lockPath), { recursive: true });

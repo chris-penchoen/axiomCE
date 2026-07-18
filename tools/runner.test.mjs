@@ -7,6 +7,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+const RUNNER = fileURLToPath(new URL("./runner.mjs", import.meta.url));
 
 import {
   claimLogPath,
@@ -23,6 +26,7 @@ import {
   publishObservation,
   observationFiles,
   isObservationFile,
+  withWriterLock,
   applyDeadLetter,
   loadDeadLetter,
   deadLetterKey,
@@ -1003,4 +1007,88 @@ test("a published observation is consumed by planSync end-to-end", () => {
   const plan = planSync(dir, {});
   assert.deepEqual(plan.files, ["drop.jsonl"]);
   assert.equal(plan.queued.length, 1);
+});
+
+// --- writer-lock mutual exclusion + cross-process contention (rt-crash-concurrency-tests) ---
+function lockPath(dir) { return path.join(dir, "runtime", "writer.lock"); }
+function plantLock(dir, over = {}) {
+  fs.mkdirSync(path.join(dir, "runtime"), { recursive: true });
+  fs.writeFileSync(lockPath(dir), JSON.stringify({
+    pid: process.pid, host: os.hostname(), acquired_at: new Date().toISOString(), cmd: "test", ...over,
+  }));
+}
+
+test("withWriterLock serializes: a second acquire while held throws 'locked'", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  const ran = withWriterLock(dir, () => {
+    // Re-entering while the lock is held (same code path a 2nd writer hits) fails.
+    assert.throws(() => withWriterLock(dir, () => "nope"), /locked by another writer/);
+    return "ok";
+  });
+  assert.equal(ran, "ok");
+});
+
+test("withWriterLock releases the lock after success AND after a throw", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  withWriterLock(dir, () => "done");
+  assert.equal(fs.existsSync(lockPath(dir)), false, "released after success");
+  assert.throws(() => withWriterLock(dir, () => { throw new Error("boom"); }), /boom/);
+  assert.equal(fs.existsSync(lockPath(dir)), false, "released after throw");
+});
+
+test("withWriterLock reclaims a STALE lock (old timestamp) and a DEAD-pid lock", () => {
+  const stale = tmpDir(); seedStore(stale);
+  plantLock(stale, { acquired_at: "2020-01-01T00:00:00Z" });        // ancient -> stale
+  assert.equal(withWriterLock(stale, () => "reclaimed-stale"), "reclaimed-stale");
+
+  const dead = tmpDir(); seedStore(dead);
+  plantLock(dead, { pid: 2147483646 });                             // almost-certainly-dead pid
+  assert.equal(withWriterLock(dead, () => "reclaimed-dead"), "reclaimed-dead");
+});
+
+test("cross-process: a live lock held by another process makes `sync --apply` refuse", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  // Plant a FRESH lock owned by THIS (alive) process on THIS host: a child
+  // running `sync --apply` must see it as held-and-not-stale and refuse.
+  plantLock(dir);
+  let code = 0, stderr = "";
+  try {
+    execFileSync(process.execPath, [RUNNER, "sync", "--apply"], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    code = e.status ?? 1;
+    stderr = (e.stderr || "") + (e.stdout || "");
+  }
+  assert.notEqual(code, 0, "child must exit non-zero while the lock is held");
+  assert.match(stderr, /locked by another writer/);
+  // The planted lock is untouched (the child did not steal a live lock).
+  assert.equal(fs.existsSync(lockPath(dir)), true);
+});
+
+test("privacy leak: a sensitive dead-lettered candidate never lands in a tracked file", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  // A malformed observation line carrying sensitive text: the raw poison is
+  // untrusted (we can't parse its classification) so it MUST be quarantined to
+  // private/ only and never copied into any tracked (public) runtime file.
+  observe(dir, "obs1.jsonl", ['{ "value": "LEAKCANARY-9876", broken json']);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.equal(plan.deadLetters.length, 1, "malformed sensitive line must be dead-lettered");
+  withWriterLock(dir, () => {
+    applyDeadLetter(dir, plan.deadLetters, { now: "2026-07-15T00:00:00Z" });
+    applySync(dir, plan, { now: "2026-07-15T00:00:00Z" });
+  });
+  // The canary IS captured — but ONLY under private/ (untracked).
+  const priv = path.join(dir, "private", "runtime", "dead-letter.jsonl");
+  assert.ok(fs.existsSync(priv) && fs.readFileSync(priv, "utf8").includes("LEAKCANARY"),
+    "sensitive poison must be preserved privately for review");
+  // Tracked (public) runtime tree must not contain the canary anywhere.
+  const pubRuntime = path.join(dir, "runtime");
+  const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
+  for (const f of walk(pubRuntime)) {
+    assert.ok(!fs.readFileSync(f, "utf8").includes("LEAKCANARY"), `canary leaked into tracked ${path.relative(dir, f)}`);
+  }
 });
