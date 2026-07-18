@@ -168,6 +168,19 @@ test("scanSensitiveData flags a medical diagnosis", () => {
   assert.ok(scanSensitiveData("diagnosed with a chronic condition").some((x) => x.includes("diagnosis")));
 });
 
+test("scanSensitiveData flags real diagnosis PHI with a health cue", () => {
+  assert.ok(scanSensitiveData("was diagnosed with depression last spring").some((x) => x.includes("diagnosis")));
+  assert.ok(scanSensitiveData("clinical diagnosis of PTSD confirmed").some((x) => x.includes("diagnosis")));
+  assert.ok(scanSensitiveData("the psychiatrist's diagnosis was bipolar").some((x) => x.includes("diagnosis")));
+});
+
+test("scanSensitiveData ignores technical 'diagnosis' with no health cue", () => {
+  assert.deepEqual(scanSensitiveData("root-cause diagnosis of the outage took an hour"), []);
+  assert.deepEqual(scanSensitiveData("we diagnosed the memory leak in the parser"), []);
+  assert.deepEqual(scanSensitiveData("the tool diagnoses build failures automatically"), []);
+  assert.deepEqual(scanSensitiveData("add a diagnosis field to the error schema"), []);
+});
+
 test("scanSensitiveData flags bankruptcy account detail (case word + amount)", () => {
   assert.ok(scanSensitiveData("Chapter 13 arrears of $4,200 owed").some((x) => x.includes("bankruptcy")));
 });

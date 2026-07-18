@@ -121,6 +121,9 @@ export function scanContent(text) {
  *   - Governance files (see GOVERNANCE_FILES) are exempt from this scanner.
  *   - Bare "custody" / "Chapter 13 compliance" / "arrears" / "trustee" without a
  *     value are intentionally NOT flagged.
+ *   - Bare "diagnosis" / "diagnosed" without a clinical/health cue nearby is
+ *     intentionally NOT flagged (ordinary technical usage: "root-cause
+ *     diagnosis", "diagnosed the outage").
  *   - Placeholder dates like <YYYY-MM-DD> contain letters and never match.
  *
  * @param {string} text
@@ -156,8 +159,19 @@ export function scanSensitiveData(text) {
     /\b(?:custody\s+order|custody\s+agreement|custody\s+arrangement|parenting\s+plan|parenting\s+time|visitation|sole\s+custody|joint\s+custody|physical\s+custody|legal\s+custody)\b/i;
   if (CUSTODY_RE.test(text)) blocks.push("custody-order language — belongs in private/");
 
-  // Medical diagnosis language.
-  if (/\bdiagnos(?:is|es|ed)\b/i.test(text)) blocks.push("medical diagnosis language — belongs in private/");
+  // Medical diagnosis: a diagnosis word co-occurring with a clinical/health cue
+  // within ~40 chars (either order). The bare word alone is intentionally NOT
+  // flagged — "root-cause diagnosis", "diagnosed the outage", "the tool
+  // diagnoses build failures" are ordinary technical usage. A health cue (a
+  // clinical context word or a common condition name) is what marks it as real
+  // medical PHI. Because the cue now gates the match, the diagnosis stem is
+  // broadened (diagnose/diagnosing included) to raise recall on genuine PHI.
+  const HEALTH_CUE = String.raw`doctor|physician|patient|clinic(?:al)?|medical|mental\s+health|psychiatr(?:y|ic|ist)|psycholog(?:ist|ical)|therapist|therapy|prescrib(?:e|ed|ing)|prescription|medication|\bmeds\b|disorder|illness|disease|chronic|depression|anxiety|bipolar|\bADHD\b|\bPTSD\b|\bOCD\b|autis(?:m|tic)|schizophreni\w*|diabet(?:es|ic)|cancer|tumou?r|asthma|epilep(?:sy|tic)|migraine`;
+  const DIAGNOSIS_RE = new RegExp(
+    String.raw`\bdiagnos(?:is|es|ed|ing|e)\b[^\n]{0,40}(?:${HEALTH_CUE})|(?:${HEALTH_CUE})[^\n]{0,40}\bdiagnos(?:is|es|ed|ing|e)\b`,
+    "i"
+  );
+  if (DIAGNOSIS_RE.test(text)) blocks.push("medical diagnosis language — belongs in private/");
 
   // Bankruptcy account detail: a bankruptcy word near a real money amount.
   const BK_RE = new RegExp(
