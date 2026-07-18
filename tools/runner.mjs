@@ -41,7 +41,12 @@ import { scanContent, scanSensitiveData } from "./privacy-check.mjs";
 
 const ROOT = path.resolve(".");
 const TODAY = new Date().toISOString().slice(0, 10);
-const PRIVATE_CLASSES = new Set(["restricted", "sensitive"]);
+// Fail-closed privacy: a claim/entity is treated as PUBLIC (tracked, may enter
+// public artifacts) ONLY if its classification is one of these explicit public
+// classes. Anything else — restricted/sensitive, but also null/missing/unknown
+// — routes to private/ (git-excluded) and is excluded from public surfaces.
+// Unclassified content is quarantined, never leaked.
+const PUBLIC_CLASSES = new Set(["public", "personal"]);
 const byId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
 // ---------------------------------------------------------------------------
@@ -233,17 +238,19 @@ export function loadQueue(root = ROOT) {
 
 /**
  * Deterministic claim-log path for an entity. Mirrors the store convention:
- * `organization:acme` -> claims/organization-acme.jsonl, and a
- * restricted/sensitive claim routes under private/ (git-excluded).
+ * `organization:acme` -> claims/organization-acme.jsonl. Fail-closed: a claim
+ * routes to the TRACKED public log only when its classification is an explicit
+ * public class (public/personal); everything else — including missing/unknown —
+ * routes under private/ (git-excluded) so unclassified content never leaks.
  * @param {string} entityId e.g. "organization:acme"
  * @param {string} classification
  * @param {string} root
  */
 export function claimLogPath(entityId, classification, root = ROOT) {
   const file = `${entityId.replace(/:/g, "-")}.jsonl`;
-  const dir = PRIVATE_CLASSES.has(classification)
-    ? path.join(root, "private", "claims")
-    : path.join(root, "claims");
+  const dir = PUBLIC_CLASSES.has(classification)
+    ? path.join(root, "claims")
+    : path.join(root, "private", "claims");
   return path.join(dir, file);
 }
 
@@ -339,7 +346,7 @@ export function assembleContext(root = ROOT, opts = {}) {
     entities = entities.filter((e) => want.has(e.id));
   }
   if (!includePrivate) {
-    entities = entities.filter((e) => !PRIVATE_CLASSES.has(e.classification));
+    entities = entities.filter((e) => PUBLIC_CLASSES.has(e.classification));
   }
 
   const manifest = {
@@ -574,7 +581,7 @@ export function evaluateCandidate(obj, ctx) {
   // block only when the claim would land in a TRACKED log; under private/ that
   // content is allowed (authoritative local context).
   const target = claimLogPath(obj.entity || "unknown:unknown", obj.classification, root);
-  const isPrivate = PRIVATE_CLASSES.has(obj.classification);
+  const isPrivate = !PUBLIC_CLASSES.has(obj.classification);
   const scanText = `${obj.value || ""}\n${obj.note || ""}`;
   const { blocks: secretBlocks, warns } = scanContent(scanText);
   for (const b of secretBlocks) problems.push(`never-store secret — ${b}`);
@@ -961,14 +968,15 @@ export const TRIAGE_BUCKETS = ["privacy-hold", "needs-clarification", "contradic
  * Categorize a single queued claim against the entity's current canon claims.
  * Deterministic; a categorizer, NOT a gate — nothing is blocked, only sorted
  * (the safety-floor logic reused for surfacing):
- *   privacy-hold        classification restricted/sensitive (never auto-anything)
+ *   privacy-hold        not an explicit public class — restricted/sensitive OR
+ *                       missing/unknown classification (never auto-anything)
  *   needs-clarification confidence === "unresolved" (a human must clarify)
  *   contradiction       promoting would create/join a LIVE contradiction on the
  *                       entity+predicate (real disagreement needing attention)
  *   ready               clean: settled confidence, public/personal, no conflict
  */
 export function triageBucket(claim, canonForEntity = [], today = TODAY) {
-  if (PRIVATE_CLASSES.has(claim.classification)) return "privacy-hold";
+  if (!PUBLIC_CLASSES.has(claim.classification)) return "privacy-hold";
   if (claim.confidence === "unresolved") return "needs-clarification";
   const { contradictions } = classify([...canonForEntity, claim], today);
   if (contradictions.has(claim.predicate)) return "contradiction";

@@ -36,7 +36,9 @@ export const DEFAULT_DORMANCY_DAYS = 90;
 
 const ENTITY_DIRS = ["entities", path.join("private", "entities")];
 const CLAIM_DIRS = ["claims", path.join("private", "claims")];
-const PRIVATE_CLASSES = new Set(["restricted", "sensitive"]);
+// Fail-closed: an entity's views are PUBLIC only for explicit public classes
+// (public/personal); restricted/sensitive AND missing/unknown route to private/.
+const PUBLIC_CLASSES = new Set(["public", "personal"]);
 
 /** Read every *.jsonl claim across the claim dirs into one array. */
 export function loadClaims(root = ROOT) {
@@ -323,9 +325,9 @@ export function renderView(entity, claims, today = TODAY) {
 /** Compute the output path for an entity's view. */
 export function viewPath(entity, root = ROOT) {
   const slug = entity.id.replace(/:/g, "-");
-  const dir = PRIVATE_CLASSES.has(entity.classification)
-    ? path.join(root, "private", "views")
-    : path.join(root, "views");
+  const dir = PUBLIC_CLASSES.has(entity.classification)
+    ? path.join(root, "views")
+    : path.join(root, "private", "views");
   return path.join(dir, `${slug}.view.md`);
 }
 

@@ -116,7 +116,7 @@ triage:
   # priority order. Each queued claim lands in exactly one bucket. It is a
   # categorizer, NOT a gate — nothing is blocked, only surfaced.
   buckets: [privacy-hold, needs-clarification, contradiction, ready]
-  privacy_hold: "classification restricted/sensitive — you decide; never automated"
+  privacy_hold: "not an explicit public class (restricted/sensitive OR missing/unknown) — you decide; never automated"
   needs_clarification: "confidence unresolved — a human must clarify"
   contradiction: "promoting would create/join a live contradiction against canon"
   ready: "clean: settled confidence, public/personal, no conflict"
@@ -165,11 +165,19 @@ tools:
 # ---------------------------------------------------------------------------
 privacy:
   classifications: [public, personal, sensitive, restricted]
+  # Fail-closed default: content routes to the TRACKED public store ONLY when its
+  # classification is an explicit public class (public|personal). Everything else
+  # — restricted/sensitive AND missing/unknown/invalid — quarantines to private/
+  # (git-excluded) and is excluded from public views/exports. Unclassified
+  # content is never leaked; classification is required at capture.
+  fail_closed: true
+  public_classes: [public, personal]
   placement:
     public: tracked
     personal: tracked
     sensitive: "prefer private/ ; tracked only with opt-in"
     restricted: "private/ only (git-excluded)"
+    unclassified: "quarantined to private/ ; capture blocks a missing classification"
   never_store:   # not even in private/
     - passwords
     - api_keys_tokens
@@ -177,7 +185,8 @@ privacy:
     - full_card_numbers
     - ssn
     - auth_codes
-  view_routing: "restricted/sensitive entity -> private/views/ ; else views/"
+  view_routing: "public/personal entity -> views/ ; everything else -> private/views/"
+  claim_routing: "public/personal claim -> claims/ ; everything else -> private/claims/"
 
 # ---------------------------------------------------------------------------
 # Layer precedence (source of truth)

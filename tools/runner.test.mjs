@@ -98,6 +98,17 @@ test("claimLogPath routes restricted/sensitive to private/claims/", () => {
   }
 });
 
+test("claimLogPath is fail-closed: missing/unknown classification quarantines to private/claims/", () => {
+  const root = tmpDir();
+  for (const cls of [null, undefined, "", "secret", "public-ish", "internal"]) {
+    assert.equal(
+      path.relative(root, claimLogPath("person:jdoe", cls, root)),
+      path.join("private", "claims", "person-jdoe.jsonl"),
+      `classification ${JSON.stringify(cls)} must route private`
+    );
+  }
+});
+
 // --- id minting ---
 test("nextClaimId returns 0001 for an unseen domain", () => {
   assert.equal(nextClaimId([], "acme"), "clm-acme-0001");
@@ -526,6 +537,13 @@ function enqueue(dir, entries) {
 test("triageBucket: restricted/sensitive -> privacy-hold (even if unresolved or conflicting)", () => {
   assert.equal(triageBucket(claim({ classification: "restricted", confidence: "unresolved" }), [], TODAY), "privacy-hold");
   assert.equal(triageBucket(claim({ classification: "sensitive" }), [], TODAY), "privacy-hold");
+});
+
+test("triageBucket is fail-closed: missing/unknown classification -> privacy-hold", () => {
+  for (const cls of [null, undefined, "", "secret", "internal"]) {
+    assert.equal(triageBucket(claim({ classification: cls }), [], TODAY), "privacy-hold",
+      `classification ${JSON.stringify(cls)} must be held`);
+  }
 });
 
 test("triageBucket: unresolved (non-private) -> needs-clarification, outranking a contradiction", () => {
