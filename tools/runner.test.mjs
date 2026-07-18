@@ -139,9 +139,11 @@ test("assembleContext surfaces a contradiction with the governing claim", () => 
   const md = assembleContext(dir, { today: TODAY }).markdown;
   // Rendered faithfully as UNRESOLVED (Axiom 11), not downplayed to one claim.
   assert.ok(md.includes("UNRESOLVED contradiction"));
-  assert.ok(md.includes("not evidence"));
-  // unresolved guard still outranks estimate as the safety-default (governing()).
-  assert.ok(md.includes("safety-default `clm-fix-0002`"));
+  assert.ok(md.includes("not auto-resolved"));
+  assert.ok(md.includes("not a settled ruling"));
+  // Evidence is tied (1 source each) → unresolved guard outranks estimate as
+  // the governing default (Axiom 10 tiebreak = confidence precedence).
+  assert.ok(md.includes("governing default `clm-fix-0002`"));
   // The losing side stays visible, not erased.
   assert.ok(md.includes("clm-fix-0001"));
   assert.ok(md.includes("Open questions"));

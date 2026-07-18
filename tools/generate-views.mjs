@@ -100,10 +100,28 @@ export function classify(claims, today = TODAY) {
 
 const byId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
+/**
+ * Evidence weight for a claim within a set sharing a predicate: the number of
+ * DISTINCT sources asserting the same value. Axiom 10 — evidence (corroboration
+ * by independent provenance, Axiom 9) outranks a confidence label. Provenance
+ * *tier/quality* is not modeled in the claim schema yet, so distinct-source
+ * COUNT is the ratified proxy (ratification_log: ax10-evidence-resolution).
+ * Value comparison is whitespace-normalized but case-sensitive — different
+ * phrasings are deliberately NOT merged (conservative: do not over-corroborate).
+ */
+export function evidenceWeight(claim, list) {
+  const norm = (v) => String(v ?? "").trim().replace(/\s+/g, " ");
+  const target = norm(claim.value);
+  const sources = new Set(
+    list.filter((c) => norm(c.value) === target).map((c) => c.source)
+  );
+  return sources.size;
+}
+
 // Governance precedence for resolving which claim *governs* a contradicted
-// predicate in a view. An explicit `unresolved` safety guard OUTRANKS an
-// optimistic `estimate` (safety-first: "unknown" must not be overridden by a
-// guess). Ties broken by lowest id.
+// predicate in a view — used ONLY as the tiebreaker under evidence weight
+// (Axiom 10). An explicit `unresolved` safety guard OUTRANKS an optimistic
+// `estimate` (safety-first: "unknown" must not be overridden by a guess).
 export const GOVERNANCE_PRECEDENCE = [
   "confirmed",
   "user-stated",
@@ -112,9 +130,20 @@ export const GOVERNANCE_PRECEDENCE = [
   "estimate",
 ];
 
-/** Pick the governing claim from a set sharing a predicate. */
+/**
+ * Pick the governing claim from a set sharing a predicate. Axiom 10: rank by
+ * evidence weight (distinct-source corroboration of the value) FIRST; break ties
+ * by confidence precedence (safety nuance: unresolved outranks estimate), then
+ * by lowest id. A lone confident-but-weakly-sourced claim does not outrank a
+ * lower-confidence value corroborated by several independent sources —
+ * disconfirming evidence cuts hardest because the opposing value simply carries
+ * more independent weight.
+ */
 export function governing(list) {
   return list.slice().sort((a, b) => {
+    const wa = evidenceWeight(a, list);
+    const wb = evidenceWeight(b, list);
+    if (wa !== wb) return wb - wa; // higher evidence weight governs
     const pa = GOVERNANCE_PRECEDENCE.indexOf(a.confidence);
     const pb = GOVERNANCE_PRECEDENCE.indexOf(b.confidence);
     const na = pa === -1 ? GOVERNANCE_PRECEDENCE.length : pa;
@@ -163,10 +192,13 @@ export function renderView(entity, claims, today = TODAY) {
     lines.push("");
     for (const [pred, list] of [...contradictions].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
       const gov = governing(list);
-      lines.push(`- **\`${pred}\`** — ${list.length} active (governing: \`${gov.id}\`, ${gov.confidence}, safety-first):`);
+      const govW = evidenceWeight(gov, list);
+      lines.push(`- **\`${pred}\`** — ${list.length} active (governing: \`${gov.id}\`, ${gov.confidence}, ` +
+        `evidence: ${govW} source${govW === 1 ? "" : "s"}):`);
       for (const c of list.sort(byId)) {
         const mark = c.id === gov.id ? " ← governs" : "";
-        lines.push(`  - \`${c.id}\` (${c.confidence}): ${c.value}${mark}` + (c.note ? ` — ${c.note}` : ""));
+        const w = evidenceWeight(c, list);
+        lines.push(`  - \`${c.id}\` (${c.confidence}; ${w} src): ${c.value}${mark}` + (c.note ? ` — ${c.note}` : ""));
       }
     }
   }

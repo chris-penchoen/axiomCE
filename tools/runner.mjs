@@ -35,7 +35,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 import { parseFrontMatter } from "./validate.mjs";
-import { loadClaims, loadEntities, classify, governing, generateAll } from "./generate-views.mjs";
+import { loadClaims, loadEntities, classify, governing, evidenceWeight, generateAll } from "./generate-views.mjs";
 import { validateClaimShape } from "./validate-claims.mjs";
 import { scanContent, scanSensitiveData } from "./privacy-check.mjs";
 
@@ -395,7 +395,7 @@ export function assembleContext(root = ROOT, opts = {}) {
     }
     const contradicted = new Set([...contradictions.keys()]);
     // One line per active predicate; for a contradicted predicate, name the
-    // governing claim (safety-first precedence) rather than silently picking.
+    // evidence-weighted governing default (Axiom 10) rather than silently picking.
     const seen = new Set();
     for (const c of active.slice().sort((a, b) =>
       a.predicate < b.predicate ? -1 : a.predicate > b.predicate ? 1 : byId(a, b))) {
@@ -405,16 +405,20 @@ export function assembleContext(root = ROOT, opts = {}) {
         seen.add(c.predicate);
         const list = contradictions.get(c.predicate);
         const gov = governing(list);
+        const govW = evidenceWeight(gov, list);
         // Faithful rendering (Axiom 11): a live contradiction is presented AS
-        // unresolved, in proportion to its weight — never downplayed to a single
-        // claim to "rely on". The governing pick is a safety-first default by
-        // confidence-label precedence, NOT an evidence ruling (Axiom 10:
-        // confidence never earns belief on its own). Every side stays visible.
-        lines.push(`- **${c.predicate}** ⚠ _(UNRESOLVED contradiction — ${list.length} active claims; no evidence ruling)_`);
-        lines.push(`  - safety-default \`${gov.id}\` _(${gov.confidence}; by confidence-label precedence, not evidence — do not treat as settled)_: ${gov.value}`);
+        // unresolved — never downplayed to a single claim to "rely on". The
+        // governing pick is an evidence-weighted DEFAULT (Axiom 10: evidence
+        // outranks confidence, tiebroken by confidence-label precedence), shown
+        // to surface the best-supported side — NOT a resolution. Auto-resolving
+        // a contradiction requires the ratified decisive-evidence bar under
+        // policy (Axiom 18); until then every side stays visible and open.
+        lines.push(`- **${c.predicate}** ⚠ _(UNRESOLVED contradiction — ${list.length} active claims; not auto-resolved)_`);
+        lines.push(`  - governing default \`${gov.id}\` _(${gov.confidence}; ${govW} src; evidence-weighted per Axiom 10, not a settled ruling)_: ${gov.value}`);
         for (const alt of list.sort(byId)) {
           if (alt.id === gov.id) continue;
-          lines.push(`  - also active: ${alt.value} _(${alt.confidence}; ${alt.id})_`);
+          const altW = evidenceWeight(alt, list);
+          lines.push(`  - also active: ${alt.value} _(${alt.confidence}; ${altW} src; ${alt.id})_`);
         }
       } else {
         lines.push(`- **${c.predicate}** _(${c.confidence})_: ${c.value}`);

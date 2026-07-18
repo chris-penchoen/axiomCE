@@ -12,6 +12,7 @@ import path from "node:path";
 import {
   classify,
   governing,
+  evidenceWeight,
   renderView,
   viewPath,
   generateAll,
@@ -124,6 +125,49 @@ test("confirmed outranks everything; ties broken by lowest id", () => {
   const c1 = claim({ id: "clm-fix-0003", confidence: "confirmed" });
   const c2 = claim({ id: "clm-fix-0001", confidence: "confirmed" });
   assert.equal(governing([c1, c2]).id, "clm-fix-0001");
+});
+
+// --- Axiom 10: evidence outranks confidence ---
+test("evidenceWeight counts distinct sources asserting the same value", () => {
+  const list = [
+    claim({ id: "a", value: "blue", source: "s1" }),
+    claim({ id: "b", value: "blue", source: "s2" }),
+    claim({ id: "c", value: "blue", source: "s1" }), // dup source — not counted twice
+    claim({ id: "d", value: "green", source: "s3" }),
+  ];
+  assert.equal(evidenceWeight(list[0], list), 2); // blue: {s1, s2}
+  assert.equal(evidenceWeight(list[3], list), 1); // green: {s3}
+});
+
+test("a well-corroborated inferred value outranks a lone confident claim", () => {
+  const confident = claim({ id: "clm-fix-0001", confidence: "confirmed", value: "blue", source: "s1" });
+  const corr1 = claim({ id: "clm-fix-0002", confidence: "inferred", value: "green", source: "s2" });
+  const corr2 = claim({ id: "clm-fix-0003", confidence: "inferred", value: "green", source: "s3" });
+  const corr3 = claim({ id: "clm-fix-0004", confidence: "inferred", value: "green", source: "s4" });
+  // green: 3 distinct sources vs blue: 1 → evidence outranks the confident label.
+  assert.equal(governing([confident, corr1, corr2, corr3]).value, "green");
+});
+
+test("disconfirming evidence cuts hardest: opposing weight beats a confident claim", () => {
+  const confident = claim({ id: "clm-fix-0001", confidence: "confirmed", value: "$400", source: "s1" });
+  const dis1 = claim({ id: "clm-fix-0002", confidence: "user-stated", value: "$250", source: "s2" });
+  const dis2 = claim({ id: "clm-fix-0003", confidence: "user-stated", value: "$250", source: "s3" });
+  assert.equal(governing([confident, dis1, dis2]).value, "$250");
+});
+
+test("at equal evidence, confidence precedence (safety nuance) still decides", () => {
+  const guard = claim({ id: "clm-fix-0002", confidence: "unresolved", value: "unknown", source: "s1" });
+  const guess = claim({ id: "clm-fix-0001", confidence: "estimate", value: "$5,000", source: "s2" });
+  // 1 source each → tie on evidence → unresolved outranks estimate.
+  assert.equal(governing([guess, guard]).id, "clm-fix-0002");
+});
+
+test("duplicate sources do not inflate evidence weight", () => {
+  const a = claim({ id: "clm-fix-0001", confidence: "inferred", value: "blue", source: "same" });
+  const b = claim({ id: "clm-fix-0002", confidence: "inferred", value: "blue", source: "same" });
+  const c = claim({ id: "clm-fix-0003", confidence: "user-stated", value: "red", source: "other" });
+  // blue: {same} = 1, red: {other} = 1 → tie → user-stated outranks inferred.
+  assert.equal(governing([a, b, c]).value, "red");
 });
 
 // --- rendering ---
