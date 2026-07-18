@@ -27,6 +27,8 @@ import {
   publishObservation,
   observationFiles,
   isObservationFile,
+  archiveProcessed,
+  QUEUE_DEPTH_WARN,
   withWriterLock,
   applyDeadLetter,
   loadDeadLetter,
@@ -1174,4 +1176,58 @@ test("applySync persists fact_fp and evidence into both the queue and the ledger
   const ledgerLine = fs.readFileSync(path.join(dir, "runtime", "ledger.jsonl"), "utf8").trim();
   assert.match(ledgerLine, /"fact_fp":"fact-/);
   assert.match(ledgerLine, /"evidence":"new-evidence"/);
+});
+
+// --- inbox archiving + soft backpressure (rt-queue-backpressure) ---
+
+test("archiveProcessed moves a fully-processed inbox file out of the watched dir", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [obsClaim({ predicate: "p1", value: "v1" })]);
+  applySync(dir, planSync(dir, { now: "2026-07-15T00:00:00Z" }), { now: "2026-07-15T00:00:00Z" });
+  const res = archiveProcessed(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.deepEqual(res.archived, ["obs1.jsonl"]);
+  // No longer visible to the consumer, so planSync stops rescanning it.
+  assert.equal(observationFiles(path.join(dir, "inbox", "observations")).length, 0);
+  // Moved (not deleted) into the git-excluded archive subdir.
+  assert.ok(fs.existsSync(path.join(res.archiveDir, "obs1.jsonl")));
+});
+
+test("archiveProcessed also archives files whose only lines were dead-lettered", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "poison.jsonl", ["{ not json"]);
+  const plan = planSync(dir, { now: "2026-07-15T00:00:00Z" });
+  applyDeadLetter(dir, plan.deadLetters, { now: "2026-07-15T00:00:00Z" });
+  const res = archiveProcessed(dir, { now: "2026-07-15T00:00:00Z" });
+  assert.deepEqual(res.archived, ["poison.jsonl"]);
+});
+
+test("archiveProcessed leaves a file with an unprocessed line in place (no data loss)", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  // First line is ingested; a SECOND line is appended after apply and never processed.
+  observe(dir, "mix.jsonl", [obsClaim({ predicate: "p1", value: "v1" })]);
+  applySync(dir, planSync(dir, { now: "2026-07-15T00:00:00Z" }), { now: "2026-07-15T00:00:00Z" });
+  const abs = path.join(dir, "inbox", "observations", "mix.jsonl");
+  fs.appendFileSync(abs, JSON.stringify(obsClaim({ predicate: "p2", value: "v2" })) + "\n");
+  const res = archiveProcessed(dir, { now: "2026-07-15T00:00:01Z" });
+  assert.equal(res.archived.length, 0, "file with an unresolved line must NOT be moved");
+  assert.ok(fs.existsSync(abs), "the file (and its unprocessed line) stays put");
+});
+
+test("archived files are skipped by observationFiles (archive subdir is not rescanned)", () => {
+  const dir = tmpDir();
+  seedStore(dir);
+  observe(dir, "obs1.jsonl", [obsClaim({ predicate: "p1", value: "v1" })]);
+  applySync(dir, planSync(dir, { now: "2026-07-15T00:00:00Z" }), { now: "2026-07-15T00:00:00Z" });
+  archiveProcessed(dir, { now: "2026-07-15T00:00:00Z" });
+  // A fresh planSync sees nothing to do (archived file no longer rescanned).
+  const plan2 = planSync(dir, { now: "2026-07-15T00:00:02Z" });
+  assert.equal(plan2.queued.length, 0);
+  assert.equal(plan2.duplicates.length, 0);
+});
+
+test("QUEUE_DEPTH_WARN is a positive soft threshold (never blocks ingestion)", () => {
+  assert.ok(Number.isInteger(QUEUE_DEPTH_WARN) && QUEUE_DEPTH_WARN > 0);
 });

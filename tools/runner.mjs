@@ -912,6 +912,54 @@ export function publishObservation(dir, name, content) {
   return final;
 }
 
+const ARCHIVE_DIRNAME = "archive";
+/** Soft backpressure: warn (never block) once the pending queue reaches this. */
+export const QUEUE_DEPTH_WARN = 500;
+
+/**
+ * Archive fully-processed observation files out of the watched directory so
+ * `planSync` stops rescanning them every run (bounds rescan cost). A file is
+ * archivable ONLY when EVERY candidate line is already resolved — recorded in
+ * the ledger (queued/duplicate) or quarantined in the dead-letter. This
+ * re-verifies against current runtime state, so a file that gained a new
+ * unprocessed line (or was overwritten) between plan and archive is left in
+ * place for the next run — never moved with unprocessed content (no data loss).
+ * Files are MOVED (rename) into inbox/observations/archive/<stamp>/ — which is
+ * git-excluded like the rest of the inbox and skipped by observationFiles.
+ * @returns {{ archived: string[], archiveDir: string|null }}
+ */
+export function archiveProcessed(root = ROOT, opts = {}) {
+  const now = opts.now || new Date().toISOString();
+  const stamp = now.replace(/[:.]/g, "-");
+  const dir = path.join(root, OBSERVATIONS_DIR);
+  const ledger = loadLedger(root);        // obs_id -> latest entry
+  const dead = loadDeadLetter(root);      // has(dl_key)
+  const archiveDir = path.join(dir, ARCHIVE_DIRNAME, stamp);
+  const archived = [];
+  for (const f of observationFiles(dir)) {
+    const abs = path.join(dir, f);
+    const lines = fs.readFileSync(abs, "utf8").split(/\r?\n/);
+    let allResolved = true;
+    for (const raw of lines) {
+      const t = raw.trim();
+      if (!t || t.startsWith("//")) continue;
+      let obj = null;
+      try { obj = JSON.parse(t); } catch { obj = null; }
+      const resolved = dead.has(deadLetterKey(t))
+        || (obj && typeof obj === "object" && !Array.isArray(obj) && ledger.has(candidateHash(obj)));
+      if (!resolved) { allResolved = false; break; }
+    }
+    if (!allResolved) continue; // changed/unprocessed — leave for next run
+    fs.mkdirSync(archiveDir, { recursive: true });
+    let dest = path.join(archiveDir, f);
+    // Never clobber on a name collision within the same archive batch.
+    if (fs.existsSync(dest)) dest = path.join(archiveDir, `${f}.${Date.now()}`);
+    fs.renameSync(abs, dest);
+    archived.push(f);
+  }
+  return { archived, archiveDir: archived.length ? archiveDir : null };
+}
+
 /**
  * Plan a sync: scan inbox/observations/*.jsonl, dedup against the ledger, run
  * the same gates as capture, and route NEW valid claims toward the ratification
@@ -1742,6 +1790,7 @@ function parseArgs(argv) {
     else if (a === "--apply") out.apply = true;
     else if (a === "--trust") out.trust = true;
     else if (a === "--watch") out.watch = true;
+    else if (a === "--keep-inbox") out.keepInbox = true;
     else if (a === "--verbose") out.verbose = true;
     else if (a === "--id") out.ids.push(argv[++i]);
     else if (a === "--all") out.all = true;
@@ -1828,20 +1877,29 @@ function runSync(opts) {
       for (const q of plan.queued) console.log(`  + ${q.claim.id} <- ${q.source_file}:${q.line}  (${q.claim.confidence}, ${q.claim.classification})${q.private ? " [private]" : ""}${q.evidence === "re-observed" ? " [re-observed]" : ""} -> queue`);
       for (const d of plan.deadLetters) console.log(`  ! ${d.source_file}:${d.line} -> dead-letter (${d.problems.length} problem(s))`);
       if (plan.queued.length) console.log(`\nRe-run with --apply to enqueue, then: node tools/runner.mjs ratify --all`);
+      const depth = loadQueue(ROOT).length;
+      if (depth >= QUEUE_DEPTH_WARN) console.error(`WARN: ratification queue depth is ${depth} (>= ${QUEUE_DEPTH_WARN}). Drain it: node tools/runner.mjs ratify --all`);
       return plan;
     }
     // Per-record quarantine (rt-dead-letter): failed candidates are set aside so
     // the clean ones still make progress — a poison record never aborts the run.
-    const { queuedCount, runManifestPath } = withWriterLock(ROOT, () => {
+    const { queuedCount, runManifestPath, archived } = withWriterLock(ROOT, () => {
       const dl = applyDeadLetter(ROOT, plan.deadLetters, {});
       const s = applySync(ROOT, plan, {});
-      return { ...s, quarantined: dl.quarantined };
+      // Archive fully-processed inbox files so we stop rescanning them (bounds
+      // rescan cost). Safe: only files whose every line is now resolved move.
+      const arch = opts.keepInbox ? { archived: [] } : archiveProcessed(ROOT, {});
+      return { ...s, quarantined: dl.quarantined, archived: arch.archived };
     });
     const dlCount = plan.deadLetters.length;
     console.log(`sync: ${queuedCount} claim(s) enqueued for ratification; ${plan.duplicates.length} duplicate(s) skipped; ${dlCount} quarantined to dead-letter; ${plan.quarantinedSkipped} already quarantined. Manifest: ${runManifestPath}`);
     if (plan.reobserved) console.log(`  (${plan.reobserved} were re-observation(s) of known fact(s) — corroboration, not new evidence.)`);
+    if (archived && archived.length) console.log(`  archived ${archived.length} processed inbox file(s) -> ${OBSERVATIONS_DIR}/${ARCHIVE_DIRNAME}/`);
     if (queuedCount) console.log(`Review: node tools/runner.mjs ratify --all   (or --id <clm-...>)`);
     if (dlCount) console.log(`Quarantined (fix the source line, then re-sync): node tools/runner.mjs dead-letter`);
+    // Soft backpressure: surface a deep queue so it gets drained; never block.
+    const depth = loadQueue(ROOT).length;
+    if (depth >= QUEUE_DEPTH_WARN) console.error(`WARN: ratification queue depth is ${depth} (>= ${QUEUE_DEPTH_WARN}). Drain it: node tools/runner.mjs ratify --all`);
     return plan;
   };
 
@@ -2094,7 +2152,7 @@ if (isMain) {
       "Usage:",
       "  runner.mjs project [--entity <id>]... [--adapter gpt|gemini] [-o <file>] [--include-private -o <private/path>]",
       "  runner.mjs import-canonical <envelope.jsonl> --trust [--apply]   # PRIVILEGED: writes straight to canon, bypasses ratification",
-      "  runner.mjs sync [--apply] [--watch]                 # observe inbox/observations/ -> ratification queue",
+      "  runner.mjs sync [--apply] [--watch] [--keep-inbox]   # observe inbox/observations/ -> ratification queue",
       "  runner.mjs ratify (--all | --id <id>...) [--discard] [--apply]   # promote queued claims into canon",
       "  runner.mjs retract --id <claim_id>... --reason \"<why>\" [--apply]   # tombstone an active canonical claim (Axiom 24; audited, kept in history)",
       "  runner.mjs triage                                   # sort the pending queue into buckets (where you're needed)",

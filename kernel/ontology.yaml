@@ -136,6 +136,8 @@ observations:
   reference_producer: "runner.mjs exports publishObservation(dir, name, content) — the reference implementation of the contract (hidden temp + fsync + rename)"
   consumer_rule: "the consumer scans FINAL files only (isObservationFile): ends in '.jsonl', not hidden (leading '.'), no temp/partial/backup marker (.tmp/.tmp-*/.partial/.swp/~). In-progress drops are skipped until renamed into place."
   torn_read_note: "even if a non-conforming producer tears a write, per-record dead-lettering (see dead_letter) means the malformed tail is quarantined per-line and the clean lines still enqueue — the atomic contract is the primary fix, dead-letter is the backstop."
+  archiving: "after a successful `sync --apply`, fully-processed observation files are MOVED (archiveProcessed) into inbox/observations/archive/<stamp>/ so planSync stops rescanning them (bounds rescan cost). A file is archived ONLY when every candidate line is resolved — in the ledger (queued/duplicate) or the dead-letter — re-verified against current state, so a file that gained a new unprocessed line is left in place (no data loss). Archive dir is git-excluded (inbox/observations/*) and skipped by observationFiles. Opt out with `--keep-inbox`."
+  backpressure: "SOFT only: when the pending ratification queue depth reaches QUEUE_DEPTH_WARN (500), `sync` prints a WARN to drain via ratify. It NEVER blocks or rejects a capture — hard caps would risk losing observations, which violates the append-only / do-no-harm ethos. Depth limits stay out until an actual depth problem exists."
 
 # ---------------------------------------------------------------------------
 # Identity: observation vs fact (rt-fact-vs-obs-identity)
